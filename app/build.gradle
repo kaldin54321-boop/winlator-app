@@ -1,9 +1,11 @@
-apply plugin: 'com.android.application'
+plugins {
+    id 'com.android.application'
+}
 
 android {
     compileSdk 34
-    namespace 'com.winlator'  // Add this (required for AGP 8.0+)
-
+    namespace 'com.winlator'
+    
     defaultConfig {
         applicationId 'com.winlator'
         minSdk 26
@@ -11,24 +13,23 @@ android {
         versionCode 28
         versionName "11.1"
     }
-
+    
     buildTypes {
         debug {
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
-
             ndk {
                 abiFilters 'arm64-v8a'
             }
         }
     }
-
+    
     lint {
         checkReleaseBuilds false
     }
-
+    
     ndkVersion '26.0.10404224'
-
+    
     externalNativeBuild {
         cmake {
             version '3.22.1'
