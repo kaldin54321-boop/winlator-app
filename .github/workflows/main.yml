@@ -19,6 +19,15 @@ jobs:
         mkdir -p app/src/main/cpp/adrenotools/lib
         git clone https://github.com/Pipetto-crypto/liblinkernsbypass.git app/src/main/cpp/adrenotools/lib/linkernsbypass
 
+    - name: Verify CMake subdirectories
+      run: |
+        for dir in winlator vortekrenderer virglrenderer midihandler libadrenotools gladiorenderer; do
+        if [ ! -d "app/src/main/cpp/$dir" ] || [ ! -f "app/src/main/cpp/$dir/CMakeLists.txt" ]; then
+        echo "ERROR: Missing directory or CMakeLists.txt for $dir"
+        exit 1
+        fi
+        done
+
     - name: Set up JDK 17
       uses: actions/setup-java@v4
       with:
