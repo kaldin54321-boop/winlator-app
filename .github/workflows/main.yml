@@ -33,9 +33,10 @@ jobs:
       run: chmod +x gradlew
 
     - name: Set up Android NDK
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y android-sdk-ndk
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r26b
+        add-to-path: true
 
     - name: Build with Gradle
       run: ./gradlew assembleDebug --stacktrace --info
