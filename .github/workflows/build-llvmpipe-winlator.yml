@@ -564,17 +564,36 @@ jobs:
           # lavapipe dep failing this gate is a real build-config bug (e.g. a
           # meson flag pulling in a new shared dep), not a device quirk.
           sudo apt-get install -y --no-install-recommends binutils-aarch64-linux-gnu > /dev/null
+          # Resolve the assets dir: this workflow runs either directly in the
+          # winlator-app repo (assets at app/src/main/assets) or in the
+          # winlator-frost-v3 parent (app/ submodule mount, assets at
+          # app/app/src/main/assets). The CI log tells which: actions/checkout
+          # logs `repository: kaldin54321-boop/winlator-app` for the former.
+          ASSET_BASE=""
+          for cand in "app/src/main/assets" "app/app/src/main/assets"; do
+            if [ -f "$cand/rootfs.tzst" ]; then ASSET_BASE="$cand"; break; fi
+          done
+          if [ -z "$ASSET_BASE" ]; then
+            echo "FATAL: rootfs.tzst found under neither app/src/main/assets nor app/app/src/main/assets -- workspace top level:" >&2
+            ls -la >&2
+            exit 1
+          fi
+          echo "==> Asset base: $ASSET_BASE"
           echo "==> Inventorying base rootfs libraries"
-          tar --zstd -tf app/app/src/main/assets/rootfs.tzst | sed 's|.*/||' | sort -u > /tmp/rootfs-files.txt
+          tar --zstd -tf "$ASSET_BASE/rootfs.tzst" | sed 's|.*/||' | sort -u > /tmp/rootfs-files.txt
           wc -l /tmp/rootfs-files.txt
+          if [ ! -s /tmp/rootfs-files.txt ]; then
+            echo "FATAL: rootfs inventory is empty -- $ASSET_BASE/rootfs.tzst is unreadable" >&2
+            exit 1
+          fi
           echo "==> Collecting NEEDED sets of shipped working drivers"
           REFDIR=/tmp/ref-drivers
           rm -rf "$REFDIR"; mkdir -p "$REFDIR"
-          for a in app/app/src/main/assets/graphics_driver/turnip-*.tzst \
-                   app/app/src/main/assets/graphics_driver/vortek-*.tzst \
-                   app/app/src/main/assets/graphics_driver/zink-*.tzst \
-                   app/app/src/main/assets/graphics_driver/virgl-*.tzst \
-                   app/app/src/main/assets/graphics_driver/gladio-*.tzst; do
+          for a in "$ASSET_BASE"/graphics_driver/turnip-*.tzst \
+                   "$ASSET_BASE"/graphics_driver/vortek-*.tzst \
+                   "$ASSET_BASE"/graphics_driver/zink-*.tzst \
+                   "$ASSET_BASE"/graphics_driver/virgl-*.tzst \
+                   "$ASSET_BASE"/graphics_driver/gladio-*.tzst; do
             [ -f "$a" ] || continue
             echo "  reference: $a"
             tar --zstd -xf "$a" -C "$REFDIR"
