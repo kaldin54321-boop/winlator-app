@@ -106,6 +106,10 @@ name: Build llvmpipe/lavapipe for Winlator Frost v3 (aarch64 glibc)
 #     silent failure / blank GPU info. Statically linking LLVM's component
 #     libraries into the driver removes that runtime dependency entirely (at
 #     the cost of a much larger .so, which is expected and correct).
+#   - llvm-config shim: llvm-config-<ver> --libs reports -lPolly/-lPollyISL,
+#     which distro llvm-dev packages do not ship, killing both final links.
+#     A /usr/local/bin shim strips those two exact flags (nothing in Mesa
+#     uses Polly); verified by a post-install assertion before meson runs.
 #   - -Dzstd=disabled: falls back to zlib for disk-cache compression instead
 #     of adding an extra libzstd.so.1 runtime dependency.
 #   - glslang-tools is installed via apt for its runtime shared libs, but the
@@ -216,6 +220,30 @@ jobs:
             libxcb-randr0-dev libxcb-sync-dev libxcb-xfixes0-dev \
             libx11-xcb-dev libxcb-keysyms1-dev \
             libxshmfence-dev libxxf86vm-dev libxrandr-dev
+
+          echo "==> Installing llvm-config shim (filter undistributed Polly libs)"
+          # llvm-config-<ver> --libs lists -lPolly/-lPollyISL as part of LLVM's
+          # static-link closure, but distro llvm-dev packages do not ship
+          # libPolly.a/libPollyISL.a, so both final links die with
+          # "cannot find -lPolly". Nothing in Mesa references Polly symbols
+          # (gallivm runs its own pass pipeline), so dropping those two exact
+          # flags is safe; a genuinely-needed Polly dep would fail instead
+          # with undefined Polly references. Shim lives in /usr/local/bin,
+          # ahead of /usr/bin on PATH; the real config is untouched.
+          # NOTE: inner heredoc delimiter is UNQUOTED so $LLVM_MAJOR expands
+          # now; \$@ stays literal so the shim receives its own arguments.
+          cat > /usr/local/bin/llvm-config-"$LLVM_MAJOR" <<SHIM_EOF
+          #!/usr/bin/env bash
+          exec /usr/bin/llvm-config-$LLVM_MAJOR "\$@" | tr ' ' '\n' | grep -v -x -e '-lPolly' -e '-lPollyISL' | tr '\n' ' '
+          SHIM_EOF
+          chmod +x /usr/local/bin/llvm-config-"$LLVM_MAJOR"
+          hash -r
+          echo "==> Verifying Polly flags are filtered"
+          if /usr/local/bin/llvm-config-"$LLVM_MAJOR" --libs 2>/dev/null | tr ' ' '\n' | grep -qx -e '-lPolly' -e '-lPollyISL'; then
+            echo "FATAL: llvm-config shim did not filter Polly flags" >&2
+            exit 1
+          fi
+          echo "Polly link flags filtered OK"
 
           # Mesa 26.x needs a meson newer than what jammy packages, so pin a
           # known-good modern meson via pip, installed straight into the
