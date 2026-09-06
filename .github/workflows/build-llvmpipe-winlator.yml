@@ -12,10 +12,15 @@ name: Build llvmpipe/lavapipe for Winlator Frost v3 (aarch64 glibc)
 #     usr/lib/libGL.so.1.7.0  -> llvmpipe, statically linked into classic
 #                                libGL (Xlib GLX target, NOT a separate
 #                                dri/*.so plugin)
-# Each archive may ALSO conditionally contain usr/lib/libtinfo.so.6 and/or
-# usr/lib/libsensors.so.5 -- private bundled copies, added automatically
-# only if the produced binary actually links against them (detected via
-# readelf after the build).
+# Each archive may ALSO conditionally contain private bundled copies, added
+# automatically only if the produced binary actually links against them
+# (detected via readelf after the build):
+#   usr/lib/libtinfo.so.6, usr/lib/libsensors.so.5 (static-LLVM fallout), and
+#   usr/lib/libxcb-xfixes.so.0, usr/lib/libxshmfence.so.1,
+#   usr/lib/libxcb-keysyms.so.1 (Mesa X11 WSI deps that Winlator's rootfs does
+#   not ship -- Turnip's freedreno WSI never needed them, which is why the gap
+#   only shows with lavapipe; the CI gate proves each one against the
+#   rootfs.tzst inventory plus every shipped driver's NEEDED set).
 #
 # Frost-v3 integration (see GraphicsDrivers.LLVMPIPE, DefaultVersion.LLVMPIPE,
 # XServerDisplayActivity.extractGraphicsDriverFiles):
@@ -389,6 +394,48 @@ jobs:
             fi
           fi
 
+          echo "==> Checking for further X11 WSI deps missing from Winlator rootfs and bundling private copies if needed"
+          # Mesa's X11 WSI links three more libs that Winlator's rootfs does
+          # not ship. Proven by the CI gate (NEEDED checked against the
+          # rootfs.tzst inventory plus every shipped driver's NEEDED set):
+          #   libxcb-xfixes.so.0  (package libxcb-xfixes0)
+          #   libxshmfence.so.1   (package libxshmfence1)
+          #   libxcb-keysyms.so.1 (package libxcb-keysyms1)
+          # Same private-copy technique as above. Their own transitive deps
+          # are only libc/libxcb, both in the rootfs, so no dep chain to chase.
+          # (Turnip's freedreno WSI does not pull these in, which is why the
+          # shipped drivers never exposed the gap.)
+          BUNDLE_DEPS="libxcb-xfixes.so.0|libxcb-xfixes0 libxshmfence.so.1|libxshmfence1 libxcb-keysyms.so.1|libxcb-keysyms1"
+          NEEDS_EXTRA_VK=""; NEEDS_EXTRA_GL=""
+          for spec in $BUNDLE_DEPS; do
+            SONAME="${spec%%|*}"; DEB="${spec##*|}"
+            SONAME_RE="$(echo "$SONAME" | sed 's/\./\\./g')"
+            NEED_VK=0; NEED_GL=0
+            if readelf -d /pkg/vulkan/usr/lib/libvulkan_lvp.so | grep -q "NEEDED.*${SONAME_RE}"; then NEED_VK=1; fi
+            if readelf -d /pkg/opengl/usr/lib/libGL.so.1.7.0 | grep -q "NEEDED.*${SONAME_RE}"; then NEED_GL=1; fi
+            if [ "$NEED_VK" = "1" ] || [ "$NEED_GL" = "1" ]; then
+              echo "$SONAME needed (vulkan=$NEED_VK opengl=$NEED_GL) -- fetching $DEB"
+              (cd /tmp/extra-libs && apt-get download "$DEB")
+              dpkg-deb -x /tmp/extra-libs/${DEB}_*.deb /tmp/extra-libs
+              SRC="$(find /tmp/extra-libs -name "$SONAME" | head -n1)" || true
+              if [ -z "$SRC" ]; then
+                echo "FATAL: $DEB .deb did not contain $SONAME" >&2
+                exit 1
+              fi
+              if [ "$NEED_VK" = "1" ]; then
+                cp -L "$SRC" /pkg/vulkan/usr/lib/"$SONAME"
+                NEEDS_EXTRA_VK="$NEEDS_EXTRA_VK $SONAME"
+              fi
+              if [ "$NEED_GL" = "1" ]; then
+                cp -L "$SRC" /pkg/opengl/usr/lib/"$SONAME"
+                NEEDS_EXTRA_GL="$NEEDS_EXTRA_GL $SONAME"
+              fi
+            fi
+          done
+          EXTRA_VK_N="$(echo "$NEEDS_EXTRA_VK" | wc -w)"
+          EXTRA_GL_N="$(echo "$NEEDS_EXTRA_GL" | wc -w)"
+          echo "bundled extra WSI deps: vulkan[$NEEDS_EXTRA_VK ] opengl[$NEEDS_EXTRA_GL ]"
+
           cat > /pkg/vulkan/usr/share/vulkan/icd.d/lvp_icd.aarch64.json <<EOF
           {
               "ICD": {
@@ -403,10 +450,10 @@ jobs:
           VK_COUNT="$(find /pkg/vulkan -type f | wc -l)"
           GL_COUNT="$(find /pkg/opengl -type f | wc -l)"
           # Baseline is 2 files for vulkan (driver + icd json), 1 for opengl
-          # (driver), plus one extra file for each of libtinfo/libsensors
-          # that got conditionally bundled above.
-          VK_EXPECTED=$((2 + NEEDS_TINFO_VK + NEEDS_SENSORS_VK))
-          GL_EXPECTED=$((1 + NEEDS_TINFO_GL + NEEDS_SENSORS_GL))
+          # (driver), plus one extra file for each of libtinfo/libsensors and
+          # each extra X11 WSI dep that got conditionally bundled above.
+          VK_EXPECTED=$((2 + NEEDS_TINFO_VK + NEEDS_SENSORS_VK + EXTRA_VK_N))
+          GL_EXPECTED=$((1 + NEEDS_TINFO_GL + NEEDS_SENSORS_GL + EXTRA_GL_N))
           if [ "$VK_COUNT" -ne "$VK_EXPECTED" ]; then
             echo "FATAL: vulkan package expected ${VK_EXPECTED} files, found ${VK_COUNT}" >&2
             find /pkg/vulkan -type f >&2
