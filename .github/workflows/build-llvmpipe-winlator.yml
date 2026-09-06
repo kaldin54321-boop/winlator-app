@@ -27,13 +27,15 @@ name: Build llvmpipe/lavapipe for Winlator Frost v3 (aarch64 glibc)
 #   - Vulkan slot "LLVMPipe" extracts
 #       assets/graphics_driver/llvmpipe-vulkan-<DefaultVersion.LLVMPIPE>.tzst
 #     into RootFS rootDir (<files>/rootfs). No GALLIUM_DRIVER override; the ICD
-#     manifest selects lavapipe. WSI present mode follows this project's Turnip
-#     policy (mailbox).
+#     manifest selects lavapipe. Presentation uses the software WSI path
+#     (MESA_VK_WSI_DEBUG=sw) with mailbox present mode (proven against this
+#     X server by the Turnip path); lavapipe has no DRM node so DRI3 present
+#     can create swapchains yet never deliver pixels.
 #   - OpenGL slot "LLVMPipe" extracts
 #       assets/graphics_driver/llvmpipe-opengl-<DefaultVersion.LLVMPIPE>.tzst
-#     into the same rootDir. No GALLIUM_DRIVER override (llvmpipe is the only
-#     gallium driver compiled into this libGL, so the default is correct) and
-#     no MESA_GL_VERSION_OVERRIDE (that override is Vortek+zink specific).
+#     into the same rootDir. GALLIUM_DRIVER=llvmpipe is set explicitly (it is
+#     the only gallium driver compiled in, so forcing it is always correct)
+#     and no MESA_GL_VERSION_OVERRIDE (that override is Vortek+zink specific).
 #     The Vulkan slot extracts first, then the OpenGL slot, so mixed combos
 #     (e.g. Turnip Vulkan + LLVMPipe OpenGL) end with the right libGL.
 #   - DefaultVersion.DXVK() treats llvmpipe like turnip (lavapipe exposes
@@ -90,6 +92,14 @@ name: Build llvmpipe/lavapipe for Winlator Frost v3 (aarch64 glibc)
 #     target rootfs provides. The ABI diagnostic step at the end prints the
 #     actual max GLIBC/GLIBCXX versions required so this can be re-checked if
 #     the rootfs glibc ever changes.
+#   - LLVM comes from apt.llvm.org, NOT jammy's repos (which stop at LLVM 15).
+#     Mesa 26's llvmpipe requires LLVM 22 (current BLFS requirement for the
+#     Mesa 26 family). Building against LLVM 15 -- seven majors behind --
+#     produces binaries that enumerate and run yet render black on AArch64:
+#     Mesa 26's reworked gallivm JIT IR miscompiles under the old backend.
+#     Same glibc-2.35 baseline either way (apt.llvm.org builds target jammy),
+#     so the ABI story below is unchanged. If you override llvm_major, keep
+#     it within Mesa 26's supported LLVM range or `meson setup` will fail.
 #   - -Dshared-llvm=false is MANDATORY. Without it, Mesa links against the
 #     shared libLLVM-*.so provided by llvm-dev, and the rootfs does not ship
 #     that library at all -- so libGL/libvulkan_lvp fail to dlopen with a
@@ -120,9 +130,9 @@ on:
         required: true
         default: "26.0.0"
       llvm_major:
-        description: "LLVM major version to build against (jammy ships 15 in its own repos, matching this ABI baseline)"
+        description: "LLVM major version to build against (from apt.llvm.org; default 22 per Mesa 26 llvmpipe requirement -- jammy's own repos stop at 15)"
         required: true
-        default: "15"
+        default: "22"
       vulkan_api_version:
         description: "api_version field written into the lavapipe ICD json"
         required: true
@@ -134,7 +144,7 @@ on:
 
 env:
   MESA_VERSION: ${{ github.event.inputs.mesa_version || '26.0.0' }}
-  LLVM_MAJOR: ${{ github.event.inputs.llvm_major || '15' }}
+  LLVM_MAJOR: ${{ github.event.inputs.llvm_major || '22' }}
   VULKAN_API_VERSION: ${{ github.event.inputs.vulkan_api_version || '1.4.335' }}
   ICD_LIBRARY_PATH: ${{ github.event.inputs.icd_library_path || '/data/data/com.winlator/files/rootfs/lib/libvulkan_lvp.so' }}
   TARGET_TRIPLE: aarch64-linux-gnu
@@ -173,10 +183,23 @@ jobs:
           VULKAN_API_VERSION="${VULKAN_API_VERSION:?}"
           ICD_LIBRARY_PATH="${ICD_LIBRARY_PATH:?}"
 
-          echo "==> Updating apt and installing mandatory build dependencies"
+          echo "==> Updating apt and installing bootstrap tools"
           apt-get update
           echo "==> Confirming base image glibc version"
           ldd --version | head -n1 || true
+          # Bare ubuntu:22.04 ships neither curl nor gnupg; both are needed
+          # before the LLVM repo below can be added (HTTPS key download).
+          apt-get install -y --no-install-recommends ca-certificates curl gnupg
+          echo "==> Adding apt.llvm.org for LLVM ${LLVM_MAJOR}"
+          # jammy's own repos stop at LLVM 15, but Mesa 26's llvmpipe requires
+          # LLVM 22 (current BLFS requirement for the Mesa 26 family; LLVM 15
+          # is seven majors behind and its AArch64 JIT backend miscompiles
+          # Mesa 26 gallivm IR -- the prime suspect for rendered-black-screen
+          # with otherwise working DXVK). Same glibc-2.35 baseline either way.
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-${LLVM_MAJOR} main" > /etc/apt/sources.list.d/llvm.list
+          echo "==> Updating apt (with LLVM repo) and installing mandatory build dependencies"
+          apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates curl xz-utils git \
             build-essential pkg-config cmake ninja-build \
@@ -405,7 +428,7 @@ jobs:
           # are only libc/libxcb, both in the rootfs, so no dep chain to chase.
           # (Turnip's freedreno WSI does not pull these in, which is why the
           # shipped drivers never exposed the gap.)
-          BUNDLE_DEPS="libxcb-xfixes.so.0|libxcb-xfixes0 libxshmfence.so.1|libxshmfence1 libxcb-keysyms.so.1|libxcb-keysyms1"
+          BUNDLE_DEPS="libxcb-xfixes.so.0|libxcb-xfixes0 libxshmfence.so.1|libxshmfence1 libxcb-keysyms.so.1|libxcb-keysyms1 libzstd.so.1|libzstd1"
           NEEDS_EXTRA_VK=""; NEEDS_EXTRA_GL=""
           for spec in $BUNDLE_DEPS; do
             SONAME="${spec%%|*}"; DEB="${spec##*|}"
