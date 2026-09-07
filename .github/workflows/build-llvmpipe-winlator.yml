@@ -44,10 +44,15 @@ name: Build llvmpipe/lavapipe for Winlator Frost v3 (aarch64 glibc)
 #     Presentation is ALWAYS the software path, env or no env: lavapipe's own
 #     lvp_wsi.c passes {.sw_device = true} to wsi_device_init (verified in Mesa
 #     source), so MESA_VK_WSI_DEBUG=sw (also set) is redundant-but-harmless.
-#     Deliberately NO MESA_VK_WSI_PRESENT_MODE override -- exact parity with
-#     alexvorxx/winlator, whose llvmpipe works without one, and this server's
-#     PresentExtension.presentPixmap ignores the mode entirely (plain copyArea
-#     either way), so forcing a mode can only narrow DXVK's negotiation.
+#     MESA_VK_WSI_PRESENT_MODE=mailbox is set for full parity with the Turnip
+#     and SwiftShader slots (both use mailbox): DXVK negotiates its swapchain
+#     mode against what the WSI offers, and mailbox is the mode this X
+#     server's Present path is exercised with. PresentExtension.presentPixmap
+#     ignores the mode (plain copyArea either way), so forcing mailbox cannot
+#     break delivery -- it only stops DXVK from settling on a mode the sw WSI
+#     path was never tested with (a black-screen-with-working-enumeration
+#     signature: vkEnumeratePhysicalDevices needs no WSI, but every presented
+#     frame does).
 #   - OpenGL slot "LLVMPipe" extracts
 #       assets/graphics_driver/llvmpipe-opengl-<DefaultVersion.LLVMPIPE>.tzst
 #     into the same rootDir. GALLIUM_DRIVER=llvmpipe is set explicitly (it is
@@ -785,6 +790,28 @@ jobs:
           # anyway), so a "must NEEDED libglapi" gate fails every build -- it
           # did exactly that. The zink/virgl libglapi linkage comes from older
           # Mesa and does not transfer. Do NOT re-add a libglapi gate.
+          # GLVND-split guard: frost-v3's OpenGL slot ships libGL.so.1.7.0 as
+          # a SINGLE self-contained file (glx=xlib bakes llvmpipe + glapi in;
+          # verified on the 26.0.0 asset: 70+ glX symbols in dynsym, no GLVND
+          # NEEDED entries). If a future Mesa/glvnd-header change silently
+          # turns libGL into a GLVND dispatcher, it would dlopen (NOT NEEDED
+          # -- invisible to the dep gate below) libGLX_mesa.so.0 /
+          # libGLdispatch.so.0 at runtime, files this project does NOT ship
+          # -- every GL client would then fail with blank GPU info while all
+          # other gates stay green (the exact "OpenGL not recognized"
+          # signature). Fail loudly here.
+          if aarch64-linux-gnu-readelf -d /tmp/abi-check/usr/lib/libGL.so.1.7.0 | grep -qi 'NEEDED.*libGLX_mesa\|NEEDED.*libGLdispatch'; then
+            echo "FATAL: libGL became a GLVND dispatcher (NEEDEDs libGLX_mesa/libGLdispatch) -- the single-file xlib assumption is broken; ship the split libs or force non-GLVND" >&2
+            exit 1
+          fi
+          if ! aarch64-linux-gnu-readelf --dyn-syms /tmp/abi-check/usr/lib/libGL.so.1.7.0 | grep -qE ' glXCreateContext( |$)'; then
+            echo "FATAL: libGL defines no glXCreateContext -- not a usable xlib GL provider" >&2
+            exit 1
+          fi
+          if ! aarch64-linux-gnu-readelf --dyn-syms /tmp/abi-check/usr/lib/libGL.so.1.7.0 | grep -qE ' glXMakeCurrent( |$)'; then
+            echo "FATAL: libGL defines no glXMakeCurrent -- not a usable xlib GL provider" >&2
+            exit 1
+          fi
           # The base rootfs only ships a libGL.so.1 symlink (pointing at
           # libGL.so.1.7.0); guests link DT_NEEDED libGL.so.1. If Mesa ever
           # changes libGL's SONAME, our renamed file would stop satisfying
