@@ -11,7 +11,12 @@ name: Build llvmpipe/lavapipe for Winlator Frost v3 (aarch64 glibc)
 #   llvmpipe-opengl-<version>.tzst
 #     usr/lib/libGL.so.1.7.0  -> llvmpipe, statically linked into classic
 #                                libGL (Xlib GLX target, NOT a separate
-#                                dri/*.so plugin)
+#                                dri/*.so plugin), linked against the shared
+#                                libglapi.so.0 that the rootfs already ships --
+#                                the exact same shape as the proven zink/virgl
+#                                libGLs (all three NEEDED libglapi; a disabled
+#                                shared-glapi build is the odd one out and
+#                                risks Winlator's GL dispatch falling over)
 # Each archive may ALSO conditionally contain private bundled copies, added
 # automatically only if the produced binary actually links against them
 # (detected via readelf after the build):
@@ -28,16 +33,24 @@ name: Build llvmpipe/lavapipe for Winlator Frost v3 (aarch64 glibc)
 #       assets/graphics_driver/llvmpipe-vulkan-<DefaultVersion.LLVMPIPE>.tzst
 #     into RootFS rootDir (<files>/rootfs). No GALLIUM_DRIVER override; the ICD
 #     manifest selects lavapipe. Presentation uses the software WSI path
-#     (MESA_VK_WSI_DEBUG=sw) with mailbox present mode (proven against this
-#     X server by the Turnip path); lavapipe has no DRM node so DRI3 present
-#     can create swapchains yet never deliver pixels.
+#     (MESA_VK_WSI_DEBUG=sw) with immediate present mode; lavapipe has no DRM
+#     node so DRI3 present can create swapchains yet never deliver pixels, and
+#     a software rasterizer has no display cadence for mailbox fences to
+#     resolve against -- immediate presents synchronously through the X
+#     server's pixmap copyArea path. (Turnip uses mailbox, but Turnip has a
+#     real DRM vsync source; that proof does not transfer to swrast.)
 #   - OpenGL slot "LLVMPipe" extracts
 #       assets/graphics_driver/llvmpipe-opengl-<DefaultVersion.LLVMPIPE>.tzst
 #     into the same rootDir. GALLIUM_DRIVER=llvmpipe is set explicitly (it is
-#     the only gallium driver compiled in, so forcing it is always correct)
-#     and no MESA_GL_VERSION_OVERRIDE (that override is Vortek+zink specific).
-#     The Vulkan slot extracts first, then the OpenGL slot, so mixed combos
-#     (e.g. Turnip Vulkan + LLVMPipe OpenGL) end with the right libGL.
+#     the only gallium driver compiled in, so forcing it is always correct),
+#     the GL version is capped to 3.3COMPAT/330 (this X server's
+#     GLXExtension.createContextAttribsARB rejects major > 3 or minor > 3
+#     while stock Mesa 26 llvmpipe defaults to 4.5 core -- without the cap
+#     every default-version context request fails and GPUInfo stays blank),
+#     and LIBGL_DRI3_DISABLE=1 forces the SHM present path (same no-DRM-node
+#     reason as the Vulkan sw flag). The Vulkan slot extracts first, then the
+#     OpenGL slot, so mixed combos (e.g. Turnip Vulkan + LLVMPipe OpenGL) end
+#     with the right libGL.
 #   - DefaultVersion.DXVK() treats llvmpipe like turnip (lavapipe exposes
 #     Vulkan 1.4 -> MAJOR_DXVK).
 #   - Place the two produced .tzst files under
@@ -110,8 +123,26 @@ name: Build llvmpipe/lavapipe for Winlator Frost v3 (aarch64 glibc)
 #     which distro llvm-dev packages do not ship, killing both final links.
 #     A /usr/local/bin shim strips those two exact flags (nothing in Mesa
 #     uses Polly); verified by a post-install assertion before meson runs.
-#   - -Dzstd=disabled: falls back to zlib for disk-cache compression instead
-#     of adding an extra libzstd.so.1 runtime dependency.
+#   - -Dzstd=disabled: falls back to zlib for disk-cache compression. NOTE it
+#     does NOT remove the libzstd.so.1 runtime dependency: the statically
+#     linked LLVM component archives still have undefined zstd symbols, so the
+#     final link re-adds -lzstd (observed NEEDED on both produced .so files).
+#     The bundling step below detects exactly this and ships a private copy;
+#     the base rootfs also ships libzstd.so.1, so either copy satisfies the
+#     loader -- but the private copy is what makes the package self-contained
+#     if the rootfs copy ever goes missing.
+#   - -Dshared-glapi=enabled: MANDATORY for structural parity with the proven
+#     zink/virgl libGLs in this project (both NEEDED libglapi.so.0, which the
+#     rootfs ships as libglapi.so.0.0.0 + symlink). A disabled shared-glapi
+#     build embeds glapi and drops the NEEDED entry, making llvmpipe's libGL
+#     the structural odd one out -- and Wine's GL dispatch on this X server is
+#     only proven against the shared-glapi shape. Costs nothing: no extra file
+#     to ship, the rootfs already provides it, and the CI gate below proves
+#     the NEEDED entry resolves.
+#   - -Dglx-direct=true: explicit direct-rendering intent (client-side llvmpipe
+#     raster into SHM pixmaps via MIT-SHM, which this X server implements).
+#     This is the default, but spelling it out protects against a future Mesa
+#     default flip silently moving us to indirect protocol rendering.
 #   - glslang-tools is installed via apt for its runtime shared libs, but the
 #     glslangValidator BINARY it provides on jammy is too old for Mesa 26.x's
 #     hard `glslang >= 12.2` requirement. A current glslangValidator is built
@@ -318,6 +349,14 @@ jobs:
           #                             expects for this driver; omit to avoid
           #                             producing files that won't be shipped
           # llvm=enabled              -> mandatory: llvmpipe JITs shaders via LLVM
+          # shared-glapi=enabled      -> MANDATORY parity with zink/virgl: Wine's
+          #                             GL dispatch here is only proven against
+          #                             libGLs that NEEDED libglapi.so.0 (shipped
+          #                             by the rootfs); a disabled build embeds
+          #                             glapi and is the structural odd one out.
+          # glx-direct=true           -> explicit direct-rendering intent: llvmpipe
+          #                             rasters client-side into SHM pixmaps via
+          #                             MIT-SHM, which this X server implements.
           meson setup build \
             --prefix=/output/usr \
             --libdir=lib \
@@ -327,12 +366,13 @@ jobs:
             -Dgallium-drivers=llvmpipe \
             -Dvulkan-drivers=swrast \
             -Dglx=xlib \
+            -Dglx-direct=true \
             -Degl=disabled \
             -Dgbm=disabled \
             -Dopengl=true \
             -Dgles1=disabled \
             -Dgles2=disabled \
-            -Dshared-glapi=disabled \
+            -Dshared-glapi=enabled \
             -Dllvm=enabled \
             -Dshared-llvm=false \
             -Dzstd=disabled \
@@ -634,6 +674,18 @@ jobs:
             fi
             echo ""
           done
+          # Structural parity with the proven zink/virgl libGLs: both NEEDED
+          # libglapi.so.0 (shipped by the rootfs), and Wine's GL dispatch on
+          # this X server is only proven against that shape. A disabled
+          # shared-glapi build embeds glapi and drops the NEEDED entry, making
+          # llvmpipe's libGL the structural odd one out -- the prime suspect
+          # for "extracted fine yet GPUInfo stays blank". Fail loudly here if
+          # -Dshared-glapi=enabled did not take effect.
+          if ! aarch64-linux-gnu-readelf -d /tmp/abi-check/usr/lib/libGL.so.1.7.0 | grep -q 'NEEDED.*libglapi\.so\.0'; then
+            echo "FATAL: libGL does not NEEDED libglapi.so.0 -- -Dshared-glapi=enabled did not take effect" >&2
+            aarch64-linux-gnu-readelf -d /tmp/abi-check/usr/lib/libGL.so.1.7.0 | grep NEEDED >&2 || true
+            exit 1
+          fi
           # The base rootfs only ships a libGL.so.1 symlink (pointing at
           # libGL.so.1.7.0); guests link DT_NEEDED libGL.so.1. If Mesa ever
           # changes libGL's SONAME, our renamed file would stop satisfying
