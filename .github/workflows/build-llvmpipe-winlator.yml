@@ -37,13 +37,17 @@ name: Build llvmpipe/lavapipe for Winlator Frost v3 (aarch64 glibc)
 #   - Vulkan slot "LLVMPipe" extracts
 #       assets/graphics_driver/llvmpipe-vulkan-<DefaultVersion.LLVMPIPE>.tzst
 #     into RootFS rootDir (<files>/rootfs). No GALLIUM_DRIVER override; the ICD
-#     manifest selects lavapipe. Presentation uses the software WSI path
-#     (MESA_VK_WSI_DEBUG=sw) with immediate present mode; lavapipe has no DRM
-#     node so DRI3 present can create swapchains yet never deliver pixels, and
-#     a software rasterizer has no display cadence for mailbox fences to
-#     resolve against -- immediate presents synchronously through the X
-#     server's pixmap copyArea path. (Turnip uses mailbox, but Turnip has a
-#     real DRM vsync source; that proof does not transfer to swrast.)
+#     manifest selects lavapipe -- and with the ICD dir wiped on every driver
+#     switch, lavapipe is the SOLE Vulkan device, so DXVK 2.4.1 selects it
+#     without any device filter (its SkipCpuDevices flag is set only when a
+#     non-CPU device is enumerated; verified in dxvk_instance.cpp source).
+#     Presentation is ALWAYS the software path, env or no env: lavapipe's own
+#     lvp_wsi.c passes {.sw_device = true} to wsi_device_init (verified in Mesa
+#     source), so MESA_VK_WSI_DEBUG=sw (also set) is redundant-but-harmless.
+#     Deliberately NO MESA_VK_WSI_PRESENT_MODE override -- exact parity with
+#     alexvorxx/winlator, whose llvmpipe works without one, and this server's
+#     PresentExtension.presentPixmap ignores the mode entirely (plain copyArea
+#     either way), so forcing a mode can only narrow DXVK's negotiation.
 #   - OpenGL slot "LLVMPipe" extracts
 #       assets/graphics_driver/llvmpipe-opengl-<DefaultVersion.LLVMPIPE>.tzst
 #     into the same rootDir. GALLIUM_DRIVER=llvmpipe is set explicitly (it is
@@ -145,10 +149,10 @@ name: Build llvmpipe/lavapipe for Winlator Frost v3 (aarch64 glibc)
 #     does NOT remove the libzstd.so.1 runtime dependency: the statically
 #     linked LLVM component archives still have undefined zstd symbols, so the
 #     final link re-adds -lzstd (observed NEEDED on both produced .so files).
-#     The bundling step below detects exactly this and ships a private copy;
-#     the base rootfs also ships libzstd.so.1, so either copy satisfies the
-#     loader -- but the private copy is what makes the package self-contained
-#     if the rootfs copy ever goes missing.
+#     It is deliberately NOT bundled: the base rootfs ships a NEWER libzstd
+#     (1.5.6 vs jammy's 1.4.8) and the CI gate proves that copy satisfies the
+#     loader -- bundling ours would downgrade a rootfs file with no restore
+#     path on driver switch. Same policy as libz/libdrm/libX11.
 #   - shared-glapi is DELIBERATELY NOT PASSED. Mesa 26 reports
 #     `DEPRECATION: Option "shared-glapi" is deprecated`, and the 2026-09-07
 #     run proved it is a no-op for the xlib target: even with
@@ -589,7 +593,14 @@ jobs:
           # are only libc/libxcb, both in the rootfs, so no dep chain to chase.
           # (Turnip's freedreno WSI does not pull these in, which is why the
           # shipped drivers never exposed the gap.)
-          BUNDLE_DEPS="libxcb-xfixes.so.0|libxcb-xfixes0 libxshmfence.so.1|libxshmfence1 libxcb-keysyms.so.1|libxcb-keysyms1 libzstd.so.1|libzstd1"
+          # Deliberately NOT bundling libzstd.so.1 even though both binaries
+          # NEEDED it: the base rootfs already ships a NEWER copy (1.5.6 vs
+          # jammy's 1.4.8), and extracting our older copy would DOWNGRADE a
+          # rootfs file that is never restored on driver switch. The CI gate
+          # below proves the rootfs copy satisfies the loader, like libz,
+          # libdrm and libX11 which are likewise rootfs-provided, never
+          # bundled.
+          BUNDLE_DEPS="libxcb-xfixes.so.0|libxcb-xfixes0 libxshmfence.so.1|libxshmfence1 libxcb-keysyms.so.1|libxcb-keysyms1"
           NEEDS_EXTRA_VK=""; NEEDS_EXTRA_GL=""
           for spec in $BUNDLE_DEPS; do
             SONAME="${spec%%|*}"; DEB="${spec##*|}"
