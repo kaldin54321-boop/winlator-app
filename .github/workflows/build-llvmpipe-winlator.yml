@@ -98,6 +98,12 @@ name: Build llvmpipe/lavapipe for Winlator Frost v3 (aarch64 glibc)
 #     (docker/setup-qemu-action), not manual dpkg --add-architecture cross-compiling.
 #     This avoids "llvm-config is an arm64 ELF binary and can't run on the amd64
 #     runner" entirely, since under emulation it runs as a true native binary.
+#     QEMU fragility note: the emulated aarch64 ldconfig segfaults under some
+#     QEMU releases (killed the 2026-09-07 run in the very first apt install),
+#     so every in-container apt-get install passes
+#     -o Dpkg::Options::="--no-triggers" -- dpkg then never executes the
+#     crashing trigger, and the build (which needs files on disk, not the
+#     ld.so cache) is unaffected.
 #   - Base image is ubuntu:22.04 (jammy). jammy ships glibc 2.35 -- glibc is
 #     backward compatible (a 2.35-linked binary loads fine on a newer system,
 #     since 2.35's symbol versions are a strict subset), whereas building on
@@ -224,7 +230,18 @@ jobs:
           ldd --version | head -n1 || true
           # Bare ubuntu:22.04 ships neither curl nor gnupg; both are needed
           # before the LLVM repo below can be added (HTTPS key download).
-          apt-get install -y --no-install-recommends ca-certificates curl gnupg
+          # -o Dpkg::Options::="--no-triggers" is MANDATORY under QEMU
+          # user-mode emulation: dpkg's libc-bin trigger executes the emulated
+          # aarch64 ldconfig, which segfaults under QEMU (observed 2026-09-07
+          # with binfmt qemu v10.2.3: "qemu: uncaught target signal 11",
+          # dpkg exit 139, apt exit 100 -- killing the run in this very first
+          # install, before any Mesa code runs). Skipping trigger processing
+          # is safe here: this build only needs files/headers/binaries on disk
+          # (llvm-config and pkg-config resolve via explicit paths, not the
+          # ld.so cache), and nothing on-device uses ld.so.cache either (the
+          # Android linker ignores it). A best-effort `ldconfig || true` after
+          # the installs below refreshes the cache when the emulator can.
+          apt-get -o Dpkg::Options::="--no-triggers" install -y --no-install-recommends ca-certificates curl gnupg
           echo "==> Adding apt.llvm.org for LLVM ${LLVM_MAJOR}"
           # jammy's own repos stop at LLVM 15, but Mesa 26's llvmpipe requires
           # LLVM 22 (current BLFS requirement for the Mesa 26 family; LLVM 15
@@ -235,7 +252,10 @@ jobs:
           echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-${LLVM_MAJOR} main" > /etc/apt/sources.list.d/llvm.list
           echo "==> Updating apt (with LLVM repo) and installing mandatory build dependencies"
           apt-get update
-          apt-get install -y --no-install-recommends \
+          # Same --no-triggers hardening as the bootstrap install above: this
+          # large install re-triggers libc-bin (and man-db) many times, and any
+          # single emulated-ldconfig segfault fails the whole run (set -e).
+          apt-get -o Dpkg::Options::="--no-triggers" install -y --no-install-recommends \
             ca-certificates curl xz-utils git \
             build-essential pkg-config cmake ninja-build \
             python3 python3-pip python3-setuptools python3-wheel \
@@ -251,6 +271,8 @@ jobs:
             libxcb-randr0-dev libxcb-sync-dev libxcb-xfixes0-dev \
             libx11-xcb-dev libxcb-keysyms1-dev \
             libxshmfence-dev libxxf86vm-dev libxrandr-dev
+          # Best-effort cache refresh; failure is tolerated (see above).
+          ldconfig || true
 
           echo "==> Installing llvm-config shim (filter undistributed Polly libs)"
           # llvm-config-<ver> --libs lists -lPolly/-lPollyISL as part of LLVM's
