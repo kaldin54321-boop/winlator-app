@@ -275,7 +275,26 @@ jobs:
           # is seven majors behind and its AArch64 JIT backend miscompiles
           # Mesa 26 gallivm IR -- the prime suspect for rendered-black-screen
           # with otherwise working DXVK). Same glibc-2.35 baseline either way.
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
+          # Retry loop: apt.llvm.org is intermittently unreachable from CI
+          # (2026-09-07 run: "curl: (7) Couldn't connect to server" while
+          # ports.ubuntu.com worked fine minutes earlier in the same run, and
+          # the key downloaded fine in earlier runs -- transient/server-side).
+          # pipefail propagates curl/gpg failures into the if-condition, which
+          # is exempt from set -e, so attempts retry instead of killing the run.
+          for i in 1 2 3 4 5; do
+            if curl -fsSL --retry 3 --retry-delay 10 --retry-all-errors \
+                https://apt.llvm.org/llvm-snapshot.gpg.key \
+                | gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg; then
+              echo "LLVM key downloaded (attempt ${i})"
+              break
+            fi
+            echo "WARNING: LLVM key download attempt ${i} failed, retrying..." >&2
+            sleep 15
+            if [ "${i}" = "5" ]; then
+              echo "FATAL: could not download LLVM key after 5 attempts" >&2
+              exit 1
+            fi
+          done
           echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-${LLVM_MAJOR} main" > /etc/apt/sources.list.d/llvm.list
           echo "==> Updating apt (with LLVM repo) and installing mandatory build dependencies"
           apt-get update
@@ -382,7 +401,11 @@ jobs:
 
           echo "==> Fetching Mesa ${MESA_VERSION} source"
           mkdir -p /build && cd /build
-          curl -fL -o "mesa-${MESA_VERSION}.tar.xz" \
+          # Retry flags: same transient-network class that killed the
+          # 2026-09-07 run at the LLVM key download (curl exit 7 against one
+          # host while others worked). Zero behavior change on success.
+          curl -fL --retry 5 --retry-delay 15 --retry-all-errors \
+            -o "mesa-${MESA_VERSION}.tar.xz" \
             "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz"
           tar xf "mesa-${MESA_VERSION}.tar.xz"
           cd "mesa-${MESA_VERSION}"
