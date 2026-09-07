@@ -99,11 +99,15 @@ name: Build llvmpipe/lavapipe for Winlator Frost v3 (aarch64 glibc)
 #     This avoids "llvm-config is an arm64 ELF binary and can't run on the amd64
 #     runner" entirely, since under emulation it runs as a true native binary.
 #     QEMU fragility note: the emulated aarch64 ldconfig segfaults under some
-#     QEMU releases (killed the 2026-09-07 run in the very first apt install),
-#     so every in-container apt-get install passes
-#     -o Dpkg::Options::="--no-triggers" -- dpkg then never executes the
-#     crashing trigger, and the build (which needs files on disk, not the
-#     ld.so cache) is unaffected.
+#     QEMU releases (binfmt qemu v10.2.3: two runs killed on 2026-09-07, dpkg
+#     exit 139 on libc-bin, apt exit 100). Defense in two layers: (1) build.sh
+#     replaces ldconfig with a no-op before any apt install -- the deterministic
+#     fix, safe because the build needs files on disk, not the ld.so cache
+#     (compiler/linker resolve via explicit -L paths; Android ignores the
+#     cache on-device); (2) every in-container apt-get install additionally
+#     passes -o Dpkg::Options::="--no-triggers" to dodge most trigger
+#     executions. Layer 2 alone proved insufficient: a large install still
+#     executes the libc-bin trigger pass at the end, so layer 1 carries it.
 #   - Base image is ubuntu:22.04 (jammy). jammy ships glibc 2.35 -- glibc is
 #     backward compatible (a 2.35-linked binary loads fine on a newer system,
 #     since 2.35's symbol versions are a strict subset), whereas building on
@@ -223,6 +227,29 @@ jobs:
           LLVM_MAJOR="${LLVM_MAJOR:?}"
           VULKAN_API_VERSION="${VULKAN_API_VERSION:?}"
           ICD_LIBRARY_PATH="${ICD_LIBRARY_PATH:?}"
+
+          echo "==> Neutralizing ldconfig inside the emulated container"
+          # DETERMINISTIC fix for the QEMU user-mode ldconfig SIGSEGV. The
+          # emulated aarch64 ldconfig segfaults under QEMU (2026-09-07 runs,
+          # binfmt qemu v10.2.3: "qemu: uncaught target signal 11", dpkg exit
+          # 139 on libc-bin, apt exit 100). -o Dpkg::Options::="--no-triggers"
+          # on the installs below dodges most trigger executions (it got the
+          # bootstrap install past its crash point), but the second run proved
+          # a large install STILL executes the libc-bin trigger pass at the
+          # end -- trigger-skipping alone is not sufficient. Replacing ldconfig
+          # with a no-op removes the crashing binary from the equation
+          # entirely, and it is safe: this build only needs files/headers/
+          # binaries on disk (compiler and linker resolve via explicit -L
+          # paths from llvm-config/pkg-config, never via the ld.so cache),
+          # and nothing on-device uses ld.so.cache either (the Android linker
+          # ignores it). The container is ephemeral (docker run --rm), so no
+          # restore is needed.
+          if LDCONFIG_PATH="$(command -v ldconfig)"; then
+            mv "$LDCONFIG_PATH" "${LDCONFIG_PATH}.qemu-broken"
+            printf '#!/bin/sh\nexit 0\n' > "$LDCONFIG_PATH"
+            chmod +x "$LDCONFIG_PATH"
+            echo "ldconfig neutralized at ${LDCONFIG_PATH}"
+          fi
 
           echo "==> Updating apt and installing bootstrap tools"
           apt-get update
