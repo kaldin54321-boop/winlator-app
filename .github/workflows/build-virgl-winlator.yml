@@ -37,12 +37,34 @@ name: Build VirGL (virpipe) for Winlator Frost v3 (aarch64 glibc)
 #   - aaptOptions already has noCompress for tzst, so no gradle change needed.
 #
 # Host side (NOT built here, intentionally): the in-app libvirglrenderer.so
-# under app/.../cpp/virglrenderer stays as-is. The virgl wire protocol is
-# backwards compatible -- a newer Mesa guest (this archive) talking to the
-# existing host renderer snapshot is the supported direction (same as distro
-# guests updating Mesa against a stable host). If glitches persist after
-# this update on an otherwise clean device, the host renderer snapshot is
-# the next suspect, not this archive.
+# under app/.../cpp/virglrenderer stays as-is, and it KEEPS WORKING with the
+# old virgl-23.1.9 asset: nothing below changes the host protocol, so the old
+# asset remains a safe fallback.
+#
+# Wire protocol (READ THIS BEFORE CHANGING ANYTHING): the frozen host speaks
+# the CLASSIC vtest wire format -- command ids 1-9 (1=CREATE_RENDERER with NO
+# payload, 2=GET_CAPS as a single request, 3=RESOURCE_CREATE as 11 words with
+# trailing backing size plus an SHM fd passed back, 4=RESOURCE_DESTROY,
+# 5/6=TRANSFER_GET/PUT as 10 words, SHM-backed, no bulk payload, 7=SUBMIT_CMD,
+# 8=RESOURCE_BUSY_WAIT), socket env VIRGL_SERVER_PATH (default
+# /tmp/.virgl_server). That is the exact format the shipped virgl-23.1.9
+# asset was built with (proven from its binary strings: VIRGL_SERVER_PATH,
+# /tmp/.virgl_server, virgl_server_winsys.c, and no vtest symbols at all).
+# Stock Mesa >= 24 instead speaks the RENUMBERED upstream protocol (CREATE=8
+# with a process-name payload, GET_CAPS2+GET_CAPS double request, CREATE2 /
+# TRANSFER2, UNREF, ping handshake, VTEST_SOCKET_NAME env) and ignores
+# VIRGL_SERVER_PATH entirely -- so a stock build connects to the wrong
+# socket and every GL client dies in virgl_block_read ("lost connection to
+# rendering server" + abort(); GPUInfo blank, TestD3D force-closes, while the
+# Wine desktop keeps rendering via MIT-SHM which needs no GL). The "Winlator
+# classic wire-compat" patch step below rewrites the vtest winsys wire
+# functions to the classic shapes/ids (protocol 0, SHM-backed, VIRGL_SERVER_PATH
+# fallback kept), so the new virpipe CORE (the actual bug fixes) runs over the
+# protocol the frozen host understands. Every hunk is anchor-verified in CI;
+# any drift fails loudly with context instead of shipping a dead driver. The
+# app additionally exports VTEST_SOCKET_NAME at the served socket path
+# (XServerDisplayActivity VIRGL branch), so new assets resolve under either
+# app generation.
 #
 # Design notes:
 #   - Builds run INSIDE a real aarch64 container via QEMU user-mode emulation
@@ -226,6 +248,466 @@ jobs:
             "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz"
           tar xf "mesa-${MESA_VERSION}.tar.xz"
           cd "mesa-${MESA_VERSION}"
+
+          echo "==> Applying Winlator classic wire-compat patch to the vtest winsys"
+          # The frozen in-app host renderer speaks the CLASSIC vtest wire
+          # format (command ids 1-9 with the old shapes -- see the header
+          # comment), while stock Mesa >= 24 speaks the renumbered upstream
+          # protocol. A stock build therefore never interoperates (wrong
+          # socket env, unknown command ids, unknown payload shapes). This
+          # step rewrites the vtest winsys wire functions to the classic
+          # shapes/ids with anchored replacements; every anchor is verified
+          # and any drift fails loudly with context instead of shipping a
+          # dead driver. The virpipe CORE (the actual bug fixes) stays stock.
+          python3 - <<'PATCH_EOF'
+          import re
+          import sys
+
+          SOCK = "src/gallium/winsys/virgl/vtest/virgl_vtest_socket.c"
+          WINS = "src/gallium/winsys/virgl/vtest/virgl_vtest_winsys.c"
+          failed = []
+
+          def read(path):
+              with open(path) as f:
+                  return f.read()
+
+          def write(path, text):
+              with open(path, "w") as f:
+                  f.write(text)
+
+          def show(path, keyword, context=3):
+              print("---- context for '%s' in %s ----" % (keyword, path))
+              lines = read(path).split("\n")
+              shown = 0
+              for i, line in enumerate(lines):
+                  if keyword in line:
+                      lo = max(0, i - context)
+                      hi = min(len(lines), i + context + 1)
+                      for j in range(lo, hi):
+                          print("%5d: %s" % (j + 1, lines[j]))
+                      shown += 1
+                      if shown >= 4:
+                          break
+              print("---- end context ----")
+
+          def replace_func(path, sig_pat, new_text, tag, ctx):
+              # Replace the whole function whose signature matches sig_pat
+              # (spanning to its opening brace) through its matching close
+              # brace. Brace matching skips comments/strings/chars. ctx is a
+              # plain keyword shown for diagnostics when the anchor drifts.
+              src = read(path)
+              m = re.search(sig_pat, src, re.S)
+              if not m:
+                  failed.append(tag + ": signature not found")
+                  show(path, ctx)
+                  return
+              open_idx = len(m.group(0)) + m.start() - 1
+              if src[open_idx] != "{":
+                  failed.append(tag + ": pattern must end at '{'")
+                  show(path, tag)
+                  return
+              depth = 0
+              i = open_idx
+              n = len(src)
+              state = None
+              while i < n:
+                  c = src[i]
+                  nxt = src[i + 1] if i + 1 < n else ""
+                  if state is None:
+                      if c == "/" and nxt == "/":
+                          state = "//"
+                          i += 2
+                          continue
+                      if c == "/" and nxt == "*":
+                          state = "/*"
+                          i += 2
+                          continue
+                      if c == '"':
+                          state = '"'
+                          i += 1
+                          continue
+                      if c == "'":
+                          state = "'"
+                          i += 1
+                          continue
+                      if c == "{":
+                          depth += 1
+                      elif c == "}":
+                          depth -= 1
+                          if depth == 0:
+                              break
+                  elif state == "//":
+                      if c == "\n":
+                          state = None
+                  elif state == "/*":
+                      if c == "*" and nxt == "/":
+                          state = None
+                          i += 2
+                          continue
+                  elif state == '"':
+                      if c == "\\":
+                          i += 2
+                          continue
+                      if c == '"':
+                          state = None
+                  elif state == "'":
+                      if c == "\\":
+                          i += 2
+                          continue
+                      if c == "'":
+                          state = None
+                  i += 1
+              if depth != 0:
+                  failed.append(tag + ": unbalanced braces")
+                  return
+              write(path, src[:m.start()] + new_text + src[i + 1:])
+              print(tag + ": replaced OK")
+
+          def replace_once(path, old, new, tag):
+              src = read(path)
+              n = src.count(old)
+              if n != 1:
+                  failed.append(tag + ": anchor found %d times (want 1)" % n)
+                  show(path, old.split("\n")[0].strip()[:40])
+                  return
+              write(path, src.replace(old, new, 1))
+              print(tag + ": replaced OK")
+
+          def assert_count(path, sub, want, tag):
+              n = read(path).count(sub)
+              print("%s: %dx (want %d)" % (tag, n, want))
+              if n != want:
+                  failed.append(tag + ": got %d, want %d" % (n, want))
+
+          def assert_min(path, sub, want, tag):
+              n = read(path).count(sub)
+              print("%s: %dx (want >= %d)" % (tag, n, want))
+              if n < want:
+                  failed.append(tag + ": got %d, want >= %d" % (n, want))
+
+          # --- S-env: fall back to VIRGL_SERVER_PATH ---
+          replace_once(SOCK,
+          'const char* socket_name = os_get_option("VTEST_SOCKET_NAME");',
+          'const char* socket_name = os_get_option("VTEST_SOCKET_NAME");\n'
+          '   /* Winlator classic: older app builds export only VIRGL_SERVER_PATH. */\n'
+          '   if (!socket_name)\n'
+          '      socket_name = os_get_option("VIRGL_SERVER_PATH");',
+          "S-env")
+
+          # --- S-init: empty CREATE on classic id 1, no name payload ---
+          replace_func(SOCK,
+          r"static int virgl_vtest_send_init\(struct virgl_vtest_winsys \*vws\)\s*\{",
+          r"""static int virgl_vtest_send_init(struct virgl_vtest_winsys *vws)
+          {
+             uint32_t buf[VTEST_HDR_SIZE];
+
+             /* Winlator classic wire format: empty CREATE_RENDERER (id 1) with no
+              * process-name payload. The frozen host server reads no payload here,
+              * so upstream's extra bytes would desync the stream. */
+             buf[VTEST_CMD_LEN] = 0;
+             buf[VTEST_CMD_ID] = 1; /* classic VCMD_CREATE_RENDERER */
+             virgl_block_write(vws->sock_fd, &buf, sizeof(buf));
+             return 0;
+          }
+          """,
+           "S-init", "virgl_vtest_send_init")
+
+          # --- S-negotiate: no handshake, always protocol 0 ---
+          replace_func(SOCK,
+          r"static int virgl_vtest_negotiate_version\(struct virgl_vtest_winsys \*vws\)\s*\{",
+          r"""static int virgl_vtest_negotiate_version(struct virgl_vtest_winsys *vws)
+          {
+             /* Winlator classic wire format has no version handshake: the frozen
+              * host server does not answer the ping, so probing would hang this
+              * client in virgl_block_read. Always speak protocol 0. */
+             (void)vws;
+             return 0;
+          }
+          """,
+           "S-negotiate", "virgl_vtest_negotiate_version")
+
+          # --- S-getcaps: single GET_CAPS on classic id 2 ---
+          replace_func(SOCK,
+          r"int virgl_vtest_send_get_caps\(.*?\)\s*\{",
+          r"""int virgl_vtest_send_get_caps(struct virgl_vtest_winsys *vws,
+                                        struct virgl_drm_caps *caps)
+          {
+             uint32_t req_buf[VTEST_HDR_SIZE];
+             uint32_t resp_buf[VTEST_HDR_SIZE];
+             uint32_t resp_size, want, got, left, n;
+             char dummy[256];
+             int ret;
+
+             /* Winlator classic wire format: a single GET_CAPS (id 2). The frozen
+              * host answers once with {caps_size + 1, 2} plus the caps bytes, so
+              * the upstream GET_CAPS2 + GET_CAPS double request (which would wait
+              * forever for a second reply) must not be used. */
+             req_buf[VTEST_CMD_LEN] = 0;
+             req_buf[VTEST_CMD_ID] = 2; /* classic VCMD_GET_CAPS */
+             virgl_block_write(vws->sock_fd, &req_buf, sizeof(req_buf));
+
+             ret = virgl_block_read(vws->sock_fd, &resp_buf, sizeof(resp_buf));
+             if (ret <= 0)
+                return 0;
+
+             resp_size = resp_buf[VTEST_CMD_LEN] > 0 ? resp_buf[VTEST_CMD_LEN] - 1 : 0;
+             want = sizeof(caps->caps);
+             got = resp_size < want ? resp_size : want;
+             if (got) {
+                ret = virgl_block_read(vws->sock_fd, &caps->caps, got);
+                if (ret <= 0)
+                   return 0;
+             }
+
+             /* Drain anything beyond our caps struct so the stream stays aligned. */
+             left = resp_size > got ? resp_size - got : 0;
+             while (left) {
+                n = left > 256u ? 256u : left;
+                ret = virgl_block_read(vws->sock_fd, dummy, n);
+                if (ret <= 0)
+                   break;
+                left -= n;
+             }
+             return 0;
+          }
+          """,
+           "S-getcaps", "virgl_vtest_send_get_caps")
+
+          # --- S-create: 11-word SHM create on classic id 3 ---
+          replace_func(SOCK,
+          r"int virgl_vtest_send_resource_create\(.*?\)\s*\{",
+          r"""int virgl_vtest_send_resource_create(struct virgl_vtest_winsys *vws,
+                                               uint32_t handle,
+                                               enum pipe_texture_target target,
+                                               uint32_t format,
+                                               uint32_t bind,
+                                               uint32_t width,
+                                               uint32_t height,
+                                               uint32_t depth,
+                                               uint32_t array_size,
+                                               uint32_t last_level,
+                                               uint32_t nr_samples,
+                                               uint32_t size,
+                                               int *out_fd)
+          {
+             uint32_t res_create_buf[11];
+             uint32_t vtest_hdr[VTEST_HDR_SIZE];
+
+             /* Winlator classic wire format: the 11-word create layout (trailing
+              * backing size) on the classic VCMD_RESOURCE_CREATE id (3), with the
+              * host passing back an SHM fd exactly like upstream CREATE2. The
+              * frozen host reads 11 words here; the stock 10-word shape would
+              * desync it. */
+             vtest_hdr[VTEST_CMD_LEN] = 11;
+             vtest_hdr[VTEST_CMD_ID] = 3; /* classic VCMD_RESOURCE_CREATE */
+
+             res_create_buf[0] = handle;
+             res_create_buf[1] = target;
+             res_create_buf[2] = format;
+             res_create_buf[3] = bind;
+             res_create_buf[4] = width;
+             res_create_buf[5] = height;
+             res_create_buf[6] = depth;
+             res_create_buf[7] = array_size;
+             res_create_buf[8] = last_level;
+             res_create_buf[9] = nr_samples;
+             res_create_buf[10] = size;
+
+             virgl_block_write(vws->sock_fd, &vtest_hdr, sizeof(vtest_hdr));
+             virgl_block_write(vws->sock_fd, &res_create_buf, sizeof(res_create_buf));
+
+             /* Zero-size resources (e.g. multisample) have no backing store and
+              * the host sends no fd for them. */
+             if (size == 0) {
+                *out_fd = -1;
+                return 0;
+             }
+
+             *out_fd = virgl_vtest_receive_fd(vws->sock_fd);
+             if (*out_fd < 0) {
+                fprintf(stderr, "failed to get fd\n");
+                return -1;
+             }
+
+             return 0;
+          }
+          """,
+           "S-create", "virgl_vtest_send_resource_create")
+
+          # --- S-xfercmd: 10-word SHM transfers, classic ids passed by callers ---
+          replace_func(SOCK,
+          r"static int virgl_vtest_send_transfer_cmd\(.*?\)\s*\{",
+          r"""static int virgl_vtest_send_transfer_cmd(struct virgl_vtest_winsys *vws,
+                                                    uint32_t vcmd,
+                                                    uint32_t handle,
+                                                    uint32_t level,
+                                                    const struct pipe_box *box,
+                                                    uint32_t buf_offset)
+          {
+             uint32_t vtest_hdr[VTEST_HDR_SIZE];
+             uint32_t cmd[10];
+
+             /* Winlator classic wire format: 10-word transfer headers, SHM-backed,
+              * no bulk payload (pixels travel through the SHM backing). Word 8 is
+              * unused, word 9 is the buffer offset. Classic ids (GET=5, PUT=6)
+              * arrive via vcmd from the callers below. */
+             vtest_hdr[VTEST_CMD_LEN] = 10;
+             vtest_hdr[VTEST_CMD_ID] = vcmd;
+
+             cmd[0] = handle;
+             cmd[1] = level;
+             cmd[2] = box->x;
+             cmd[3] = box->y;
+             cmd[4] = box->z;
+             cmd[5] = box->width;
+             cmd[6] = box->height;
+             cmd[7] = box->depth;
+             cmd[8] = 0;
+             cmd[9] = buf_offset;
+             virgl_block_write(vws->sock_fd, &vtest_hdr, sizeof(vtest_hdr));
+             virgl_block_write(vws->sock_fd, &cmd, sizeof(cmd));
+
+             return 0;
+          }
+          """,
+           "S-xfercmd", "virgl_vtest_send_transfer_cmd")
+
+          # --- S-get/S-put: header-only callers with classic ids ---
+          replace_func(SOCK,
+          r"int virgl_vtest_send_transfer_get\(.*?\)\s*\{",
+          r"""int virgl_vtest_send_transfer_get(struct virgl_vtest_winsys *vws,
+                                            uint32_t handle,
+                                            uint32_t level, uint32_t stride,
+                                            uint32_t layer_stride,
+                                            const struct pipe_box *box,
+                                            uint32_t data_size,
+                                            uint32_t offset)
+          {
+             /* Winlator classic: header-only; completion is barriered by the
+              * busy-wait in the winsys transfer_get path. */
+             return virgl_vtest_send_transfer_cmd(vws, 5 /* classic VCMD_TRANSFER_GET */,
+                                                  handle, level, box, offset);
+          }
+          """,
+           "S-get", "virgl_vtest_send_transfer_get")
+
+          replace_func(SOCK,
+          r"int virgl_vtest_send_transfer_put\(.*?\)\s*\{",
+          r"""int virgl_vtest_send_transfer_put(struct virgl_vtest_winsys *vws,
+                                            uint32_t handle,
+                                            uint32_t level, uint32_t stride,
+                                            uint32_t layer_stride,
+                                            const struct pipe_box *box,
+                                            uint32_t data_size,
+                                            uint32_t offset)
+          {
+             /* Winlator classic: header-only; pixels already live in the SHM
+              * backing, so no bulk payload follows. */
+             return virgl_vtest_send_transfer_cmd(vws, 6 /* classic VCMD_TRANSFER_PUT */,
+                                                  handle, level, box, offset);
+          }
+          """,
+           "S-put", "virgl_vtest_send_transfer_put")
+
+          # --- S-unref/submit/busy: classic ids ---
+          replace_once(SOCK,
+          "vtest_hdr[VTEST_CMD_ID] = VCMD_RESOURCE_UNREF;",
+          "vtest_hdr[VTEST_CMD_ID] = 4; /* Winlator classic VCMD_RESOURCE_DESTROY */",
+          "S-unref")
+          replace_once(SOCK,
+          "vtest_hdr[VTEST_CMD_ID] = VCMD_SUBMIT_CMD;",
+          "vtest_hdr[VTEST_CMD_ID] = 7; /* Winlator classic VCMD_SUBMIT_CMD */",
+          "S-submit")
+          replace_once(SOCK,
+          "vtest_hdr[VTEST_CMD_ID] = VCMD_RESOURCE_BUSY_WAIT;",
+          "vtest_hdr[VTEST_CMD_ID] = 8; /* Winlator classic VCMD_RESOURCE_BUSY_WAIT */",
+          "S-busy")
+
+          # --- W1a: drop the local-malloc backing branch ---
+          replace_once(WINS,
+          "   } else if (vtws->protocol_version < 2) {\n"
+          "      res->ptr = align_malloc(size, 64);\n"
+          "      if (!res->ptr) {\n"
+          "         FREE(res);\n"
+          "         return NULL;\n"
+          "      }\n"
+          "   }",
+          "   }\n"
+          "   /* Winlator classic: no local malloc backing; every sized resource is\n"
+          "    * backed by host-provided SHM mapped below. */",
+          "W1a-malloc")
+
+          # --- W1b: always SHM-map the host backing ---
+          replace_once(WINS,
+          "   if (vtws->protocol_version >= 2) {\n"
+          "      if (res->size == 0) {",
+          "   /* Winlator classic: always SHM-map the host backing (zero-size\n"
+          "    * resources have none); the version gate is intentionally dropped. */\n"
+          "   {\n"
+          "      if (res->size == 0) {",
+          "W1b-mmap")
+
+          # --- W2: transfer_put is header-only (no bulk) ---
+          replace_once(WINS,
+          "   if (vtws->protocol_version >= 2)\n"
+          "      return 0;\n"
+          "\n"
+          "   ptr = virgl_vtest_resource_map(vws, res);\n"
+          "   virgl_vtest_send_transfer_put_data(vtws, ptr + buf_offset, size);\n"
+          "   virgl_vtest_resource_unmap(vws, res);\n"
+          "   return 0;",
+          "   /* Winlator classic: pixels already live in the SHM backing, so the\n"
+          "    * header sent above is the whole transfer. */\n"
+          "   return 0;",
+          "W2-put")
+
+          # --- W3: transfer_get reads host-written SHM behind a busy-wait barrier ---
+          replace_once(WINS,
+          "   } else {\n"
+          "      ptr = virgl_vtest_resource_map(vws, res);\n"
+          "      virgl_vtest_recv_transfer_get_data(vtws, ptr + buf_offset, size,\n"
+          "                                         valid_stride, box, res->format);\n"
+          "      virgl_vtest_resource_unmap(vws, res);\n"
+          "   }",
+          "   } else {\n"
+          "      /* Winlator classic: the host wrote the result straight into our\n"
+          "       * SHM backing while processing the header above and sends no\n"
+          "       * reply, so a busy-wait round trip is the completion barrier.\n"
+          "       * The map/unmap pair keeps display-target mappings balanced. */\n"
+          "      virgl_vtest_busy_wait(vtws, res->res_handle, 0);\n"
+          "      ptr = virgl_vtest_resource_map(vws, res);\n"
+          "      virgl_vtest_resource_unmap(vws, res);\n"
+          "   }",
+          "W3-get")
+
+          # --- W4: backings are always SHM mappings (or NULL) ---
+          replace_once(WINS,
+          "   if (vtws->protocol_version >= 2) {\n"
+          "      if (res->ptr)\n"
+          "         os_munmap(res->ptr, res->size);\n"
+          "   } else {\n"
+          "      align_free(res->ptr);\n"
+          "   }",
+          "   /* Winlator classic: every backing is a host-SHM mapping (or NULL). */\n"
+          "   if (res->ptr)\n"
+          "      os_munmap(res->ptr, res->size);",
+          "W4-destroy")
+
+          # --- verification: every hunk left exactly one marker ---
+          assert_count(SOCK, "Winlator classic", 11, "A-sock-markers")
+          assert_count(WINS, "Winlator classic", 5, "A-wins-markers")
+          assert_min(SOCK, "VIRGL_SERVER_PATH", 2, "A-env-fallback")
+          assert_count(WINS, "align_malloc(size, 64)", 0, "A-no-malloc")
+          assert_count(WINS, "virgl_vtest_send_transfer_put_data", 0, "A-no-put-bulk")
+          assert_count(WINS, "virgl_vtest_recv_transfer_get_data", 0, "A-no-get-bulk")
+
+          if failed:
+              print("PATCH FAILED:")
+              for f in failed:
+                  print("  - " + f)
+              sys.exit(1)
+          print("Winlator classic wire-compat patch applied cleanly")
+          PATCH_EOF
 
           echo "==> Configuring build (single-file classic libGL with virpipe baked in)"
           # gallium-drivers=virgl,softpipe -> virpipe is the driver this
@@ -415,6 +897,22 @@ jobs:
 
           echo "==> Contents:"
           tar --zstd -tvf "/artifacts/virgl-${MESA_VERSION}.tzst"
+
+          echo "==> Asserting wire-compat markers in the shipped binary"
+          # VTEST_SOCKET_NAME is the env var the patched vtest winsys reads
+          # (the app sets it at the served socket path); VIRGL_SERVER_PATH is
+          # the legacy fallback for older app builds. If either string is
+          # gone, the patch above did not apply and no guest process could
+          # ever reach the host renderer.
+          if ! grep -qa 'VTEST_SOCKET_NAME' /pkg/virgl/usr/lib/libGL.so.1.7.0; then
+            echo "FATAL: VTEST_SOCKET_NAME missing from libGL -- wire-compat patch did not apply" >&2
+            exit 1
+          fi
+          if ! grep -qa 'VIRGL_SERVER_PATH' /pkg/virgl/usr/lib/libGL.so.1.7.0; then
+            echo "FATAL: VIRGL_SERVER_PATH fallback missing from libGL -- wire-compat patch did not apply" >&2
+            exit 1
+          fi
+          echo "wire-compat markers OK"
 
           echo "==> Done"
           ls -lh /artifacts
