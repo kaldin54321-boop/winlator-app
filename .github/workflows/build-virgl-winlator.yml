@@ -733,9 +733,29 @@ jobs:
           "      os_munmap(res->ptr, res->size);",
           "W4-destroy")
 
+          # --- W5: never take the blob create path (frozen host has no handler) ---
+          replace_once(WINS,
+          "   if ((flags & (VIRGL_RESOURCE_FLAG_MAP_PERSISTENT |\n"
+          "                 VIRGL_RESOURCE_FLAG_MAP_COHERENT))) {",
+          "   /* Winlator classic: the frozen host serves ids 1-9 only and has no\n"
+          "    * CREATE_BLOB handler; a blob create would get no reply and hang the\n"
+          "    * GL thread forever (black window, FPS 0, GPU idle). Force every\n"
+          "    * resource through the classic SHM create above; persistents are\n"
+          "    * served synchronously instead. */\n"
+          "   if (0) {",
+          "W5-noblob")
+
+          # --- W6: do not advertise coherent/persistent maps to the driver core ---
+          replace_once(WINS,
+          "   vtws->base.supports_coherent = 1;",
+          "   /* Winlator classic: see W5 -- keep the driver core off the persistent/\n"
+          "    * coherent fast path so it uses synchronous transfers instead. */\n"
+          "   vtws->base.supports_coherent = 0;",
+          "W6-nocoherent")
+
           # --- verification: every hunk left exactly one marker ---
           assert_count(SOCK, "Winlator classic", 11, "A-sock-markers")
-          assert_count(WINS, "Winlator classic", 5, "A-wins-markers")
+          assert_count(WINS, "Winlator classic", 7, "A-wins-markers")
           assert_min(SOCK, "VIRGL_SERVER_PATH", 2, "A-env-fallback")
           assert_count(WINS, "align_malloc(size, 64)", 0, "A-no-malloc")
           assert_count(WINS, "virgl_vtest_send_transfer_put_data", 0, "A-no-put-bulk")
