@@ -168,7 +168,7 @@ jobs:
       - name: Create output directory
         run: mkdir -p "${{ github.workspace }}/artifacts"
 
-      - name: Write in-container build script (part 1: toolchain and sources)
+      - name: Write build script part 1 - toolchain and sources
         run: |
           cat > "${{ github.workspace }}/build.sh" <<'PART1_EOF'
           #!/usr/bin/env bash
@@ -250,7 +250,7 @@ jobs:
           cd "mesa-${MESA_VERSION}"
           PART1_EOF
 
-      - name: Write wire-compat patch script (part A: socket transport)
+      - name: Write wire-compat patch script part A - socket transport
         run: |
           # The frozen in-app host renderer speaks the CLASSIC vtest wire
           # format (command ids 1-9 with the old shapes -- see the header
@@ -539,7 +539,7 @@ jobs:
            "S-create", "virgl_vtest_send_resource_create")
           PYEOF_A
 
-      - name: Write wire-compat patch script (part B: transfers and verification)
+      - name: Write wire-compat patch script part B - transfers and verification
         run: |
           cat >> "${{ github.workspace }}/patch-virgl.py" <<'PYEOF_B'
 
@@ -718,7 +718,7 @@ jobs:
           print("Winlator classic wire-compat patch applied cleanly")
           PYEOF_B
 
-      - name: Write in-container build script (part 2: configure, build, package)
+      - name: Write build script part 2 - configure, build, package
         run: |
           cat >> "${{ github.workspace }}/build.sh" <<'PART2_EOF'
 
