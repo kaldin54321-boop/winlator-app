@@ -168,9 +168,9 @@ jobs:
       - name: Create output directory
         run: mkdir -p "${{ github.workspace }}/artifacts"
 
-      - name: Write in-container build script
+      - name: Write in-container build script (part 1: toolchain and sources)
         run: |
-          cat > "${{ github.workspace }}/build.sh" <<'BUILD_SCRIPT'
+          cat > "${{ github.workspace }}/build.sh" <<'PART1_EOF'
           #!/usr/bin/env bash
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
@@ -248,18 +248,22 @@ jobs:
             "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz"
           tar xf "mesa-${MESA_VERSION}.tar.xz"
           cd "mesa-${MESA_VERSION}"
+          PART1_EOF
 
-          echo "==> Applying Winlator classic wire-compat patch to the vtest winsys"
+      - name: Write wire-compat patch script (part A: socket transport)
+        run: |
           # The frozen in-app host renderer speaks the CLASSIC vtest wire
           # format (command ids 1-9 with the old shapes -- see the header
           # comment), while stock Mesa >= 24 speaks the renumbered upstream
           # protocol. A stock build therefore never interoperates (wrong
           # socket env, unknown command ids, unknown payload shapes). This
-          # step rewrites the vtest winsys wire functions to the classic
+          # script rewrites the vtest winsys wire functions to the classic
           # shapes/ids with anchored replacements; every anchor is verified
           # and any drift fails loudly with context instead of shipping a
           # dead driver. The virpipe CORE (the actual bug fixes) stays stock.
-          python3 - <<'PATCH_EOF'
+          # Written in two parts (this step plus the next) so that no single
+          # run: block exceeds the workflow expression length limit.
+          cat > "${{ github.workspace }}/patch-virgl.py" <<'PYEOF_A'
           import re
           import sys
 
@@ -533,6 +537,11 @@ jobs:
           }
           """,
            "S-create", "virgl_vtest_send_resource_create")
+          PYEOF_A
+
+      - name: Write wire-compat patch script (part B: transfers and verification)
+        run: |
+          cat >> "${{ github.workspace }}/patch-virgl.py" <<'PYEOF_B'
 
           # --- S-xfercmd: 10-word SHM transfers, classic ids passed by callers ---
           replace_func(SOCK,
@@ -707,7 +716,14 @@ jobs:
                   print("  - " + f)
               sys.exit(1)
           print("Winlator classic wire-compat patch applied cleanly")
-          PATCH_EOF
+          PYEOF_B
+
+      - name: Write in-container build script (part 2: configure, build, package)
+        run: |
+          cat >> "${{ github.workspace }}/build.sh" <<'PART2_EOF'
+
+          echo "==> Applying Winlator classic wire-compat patch to the vtest winsys"
+          python3 /patch-virgl.py
 
           echo "==> Configuring build (single-file classic libGL with virpipe baked in)"
           # gallium-drivers=virgl,softpipe -> virpipe is the driver this
@@ -916,7 +932,7 @@ jobs:
 
           echo "==> Done"
           ls -lh /artifacts
-          BUILD_SCRIPT
+          PART2_EOF
           chmod +x "${{ github.workspace }}/build.sh"
 
       - name: Build inside emulated aarch64 ubuntu:22.04 container
@@ -925,6 +941,7 @@ jobs:
             --platform linux/arm64 \
             -e MESA_VERSION="${{ env.MESA_VERSION }}" \
             -v "${{ github.workspace }}/build.sh:/build.sh:ro" \
+            -v "${{ github.workspace }}/patch-virgl.py:/patch-virgl.py:ro" \
             -v "${{ github.workspace }}/artifacts:/artifacts" \
             ubuntu:22.04 \
             bash /build.sh
