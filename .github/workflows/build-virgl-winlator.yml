@@ -418,13 +418,14 @@ jobs:
 
           # --- S-negotiate: no handshake, always protocol 0 ---
           replace_func(SOCK,
-          r"static int virgl_vtest_negotiate_version\(struct virgl_vtest_winsys \*vws\)\s*\{",
-          r"""static int virgl_vtest_negotiate_version(struct virgl_vtest_winsys *vws)
+          r"static int virgl_vtest_negotiate_version\(.*?\)\s*\{",
+          r"""static int virgl_vtest_negotiate_version(struct virgl_vtest_winsys *vws, int version)
           {
              /* Winlator classic wire format has no version handshake: the frozen
               * host server does not answer the ping, so probing would hang this
               * client in virgl_block_read. Always speak protocol 0. */
              (void)vws;
+             (void)version;
              return 0;
           }
           """,
@@ -628,8 +629,12 @@ jobs:
           "vtest_hdr[VTEST_CMD_ID] = 7; /* Winlator classic VCMD_SUBMIT_CMD */",
           "S-submit")
           replace_once(SOCK,
-          "vtest_hdr[VTEST_CMD_ID] = VCMD_RESOURCE_BUSY_WAIT;",
-          "vtest_hdr[VTEST_CMD_ID] = 8; /* Winlator classic VCMD_RESOURCE_BUSY_WAIT */",
+          "vtest_hdr[VTEST_CMD_LEN] = VCMD_BUSY_WAIT_SIZE;\n"
+          "   vtest_hdr[VTEST_CMD_ID] = VCMD_RESOURCE_BUSY_WAIT;\n"
+          "   cmd[VCMD_BUSY_WAIT_HANDLE] = handle;",
+          "vtest_hdr[VTEST_CMD_LEN] = VCMD_BUSY_WAIT_SIZE;\n"
+          "   vtest_hdr[VTEST_CMD_ID] = 8; /* Winlator classic VCMD_RESOURCE_BUSY_WAIT */\n"
+          "   cmd[VCMD_BUSY_WAIT_HANDLE] = handle;",
           "S-busy")
 
           # --- W1a: drop the local-malloc backing branch ---
