@@ -838,8 +838,11 @@ jobs:
           "W8-flushdt")
 
           # --- verification: every hunk left exactly one marker ---
-          assert_count(SOCK, "Winlator classic", 11, "A-sock-markers")
-          assert_count(WINS, "Winlator classic", 9, "A-wins-markers")
+          # NOTE: S-submit2 and W7-flush9 each legitimately contain TWO
+          # "Winlator classic" markers (explanatory comment + code comment),
+          # hence 12 SOCK / 10 WINS rather than 11 / 9.
+          assert_count(SOCK, "Winlator classic", 12, "A-sock-markers")
+          assert_count(WINS, "Winlator classic", 10, "A-wins-markers")
           assert_min(SOCK, "VIRGL_SERVER_PATH", 2, "A-env-fallback")
           assert_count(WINS, "align_malloc(size, 64)", 0, "A-no-malloc")
           assert_count(WINS, "virgl_vtest_send_transfer_put_data", 0, "A-no-put-bulk")
