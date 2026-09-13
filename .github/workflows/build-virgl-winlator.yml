@@ -502,7 +502,11 @@ jobs:
               * backing size) on the classic VCMD_RESOURCE_CREATE id (3), with the
               * host passing back an SHM fd exactly like upstream CREATE2. The
               * frozen host reads 11 words here; the stock 10-word shape would
-              * desync it. */
+              * desync it.
+              * RETURNS THE HANDLE (0 = failure): the winsys caller does
+              * new_handle = send_resource_create(...); if (new_handle == 0) fail.
+              * Returning 0 on success would fail EVERY resource and NULL-deref
+              * in TestD3D (page fault at 0). */
              vtest_hdr[VTEST_CMD_LEN] = 11;
              vtest_hdr[VTEST_CMD_ID] = 3; /* classic VCMD_RESOURCE_CREATE */
 
@@ -525,16 +529,16 @@ jobs:
               * the host sends no fd for them. */
              if (size == 0) {
                 *out_fd = -1;
-                return 0;
+                return handle;
              }
 
              *out_fd = virgl_vtest_receive_fd(vws->sock_fd);
              if (*out_fd < 0) {
                 fprintf(stderr, "failed to get fd\n");
-                return -1;
+                return 0;
              }
 
-             return 0;
+             return handle;
           }
           """,
            "S-create", "virgl_vtest_send_resource_create")
