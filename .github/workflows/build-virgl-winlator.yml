@@ -100,7 +100,7 @@ name: Build VirGL (virpipe) for Winlator Frost v3 (aarch64 glibc)
 #     driver. (The base rootfs ships a NEWER libzstd than jammy anyway, same
 #     policy as libz/libdrm/libX11: rootfs-provided, never bundled.)
 #   - Extra gallium media/VDPAU/VA/CL targets are left at Mesa defaults: with
-#     gallium-drivers=virgl they are either skipped or built but never
+#     gallium-drivers=virgl,softpipe they are either skipped or built but never
 #     packaged (only libGL.so.* is collected). Deliberately NOT passing
 #     -Dgallium-va/-Dgallium-vdpau/-Dgallium-omx: their exact option spelling
 #     changed across Mesa majors and a wrong spelling fails `meson setup`
@@ -228,10 +228,22 @@ jobs:
           cd "mesa-${MESA_VERSION}"
 
           echo "==> Configuring build (single-file classic libGL with virpipe baked in)"
-          # gallium-drivers=virgl  -> the ONLY gallium driver being built; the
-          #                            xlib libGL below contains virpipe and
-          #                            nothing else, so the app's
-          #                            GALLIUM_DRIVER=virpipe always resolves
+          # gallium-drivers=virgl,softpipe -> virpipe is the driver this
+          #                            package serves; softpipe is compiled in
+          #                            alongside it because Mesa HARD-REQUIRES
+          #                            it for the xlib target (`meson setup`
+          #                            fails outright with "xlib based GLX
+          #                            requires softpipe or llvmpipe"
+          #                            otherwise -- observed 2026-09-13 on Mesa
+          #                            25.0.0). softpipe is never selected at
+          #                            runtime: the app forces
+          #                            GALLIUM_DRIVER=virpipe, and softpipe
+          #                            needs no LLVM JIT, so -Dllvm=disabled
+          #                            below stays valid. This pairing is
+          #                            proven: the shipped virgl-23.1.9 libGL
+          #                            contains exactly virpipe + softpipe
+          #                            (and no llvmpipe), so the CI gates
+          #                            below assert that same composition.
           # vulkan-drivers= (empty) -> virgl is OpenGL-slot-only; no ICD, no
           #                            manifest, no glslangValidator needed
           # glx=xlib                 -> MANDATORY for a single self-contained
@@ -266,7 +278,7 @@ jobs:
             --buildtype=release \
             -Db_ndebug=true \
             -Dplatforms=x11 \
-            -Dgallium-drivers=virgl \
+            -Dgallium-drivers=virgl,softpipe \
             -Dvulkan-drivers= \
             -Dglx=xlib \
             -Dglx-direct=true \
@@ -303,20 +315,27 @@ jobs:
             exit 1
           fi
 
-          echo "==> Asserting the baked gallium driver is virpipe (not llvmpipe/zink)"
+          echo "==> Asserting the baked gallium drivers are virpipe + softpipe (not llvmpipe)"
           # GALLIUM_DRIVER=virpipe (set app-side) only resolves if virpipe is
           # actually compiled into this libGL. A misconfigured gallium-drivers
           # value would silently produce a libGL that loads yet serves no
           # virpipe device -- the "driver not detected" signature. Fail here.
+          # softpipe must be present too: Mesa hard-requires it for the xlib
+          # target, and the proven virgl-23.1.9 asset carries exactly this
+          # virpipe + softpipe composition.
           if ! grep -qa 'virpipe' "$GL_SRC"; then
-            echo "FATAL: virpipe not found in $GL_SRC -- gallium-drivers=virgl did not take effect" >&2
+            echo "FATAL: virpipe not found in $GL_SRC -- gallium-drivers=virgl,softpipe did not take effect" >&2
+            exit 1
+          fi
+          if ! grep -qa 'softpipe' "$GL_SRC"; then
+            echo "FATAL: softpipe not found in $GL_SRC -- the xlib-GLX meson requirement is not satisfied" >&2
             exit 1
           fi
           if grep -qa 'llvmpipe' "$GL_SRC"; then
             echo "FATAL: llvmpipe found in $GL_SRC -- wrong gallium driver baked in" >&2
             exit 1
           fi
-          echo "virpipe baked in OK"
+          echo "virpipe + softpipe baked in OK"
 
           echo "==> Assembling the archive frost-v3's extraction code expects"
           # OpenGL slot "VirGL" extracts graphics_driver/virgl-<ver>.tzst
@@ -469,19 +488,25 @@ jobs:
             echo "FATAL: $f still depends on a shared libLLVM -- -Dllvm=disabled did not take effect" >&2
             exit 1
           fi
-          # virpipe proof: GALLIUM_DRIVER=virpipe (set app-side in the VIRGL
-          # branch) only resolves if virpipe is actually baked into this
-          # libGL. A wrong gallium-drivers value would load yet serve no
-          # virpipe device -- the "driver not detected" signature.
+          # virpipe + softpipe proof: GALLIUM_DRIVER=virpipe (set app-side in
+          # the VIRGL branch) only resolves if virpipe is actually baked into
+          # this libGL. A wrong gallium-drivers value would load yet serve no
+          # virpipe device -- the "driver not detected" signature. softpipe
+          # is asserted too: Mesa hard-requires it for the xlib target and
+          # the proven virgl-23.1.9 asset carries exactly this composition.
           if ! aarch64-linux-gnu-strings "$f" | grep -q 'virpipe'; then
-            echo "FATAL: virpipe not found in $f -- gallium-drivers=virgl did not take effect; GALLIUM_DRIVER=virpipe would resolve nothing" >&2
+            echo "FATAL: virpipe not found in $f -- gallium-drivers=virgl,softpipe did not take effect; GALLIUM_DRIVER=virpipe would resolve nothing" >&2
+            exit 1
+          fi
+          if ! aarch64-linux-gnu-strings "$f" | grep -q 'softpipe'; then
+            echo "FATAL: softpipe not found in $f -- the xlib-GLX meson requirement is not satisfied" >&2
             exit 1
           fi
           if aarch64-linux-gnu-strings "$f" | grep -q 'llvmpipe'; then
             echo "FATAL: llvmpipe found in $f -- wrong gallium driver baked in" >&2
             exit 1
           fi
-          echo "virpipe baked in OK"
+          echo "virpipe + softpipe baked in OK"
           # GLVND-split guard (same as the llvmpipe flow): frost-v3's OpenGL
           # slot ships libGL.so.1.7.0 as a SINGLE self-contained file
           # (glx=xlib bakes the gallium driver + glapi in). If a future
