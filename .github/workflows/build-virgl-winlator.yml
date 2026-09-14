@@ -960,8 +960,8 @@ jobs:
           # logcat keeps early lines. No creates logged here plus X1 firing
           # below means the frontend never got as far as swap.
           replace_once(WINS,
-          " out:\n"
-          "    virgl_resource_cache_entry_init(&res->cache_entry, params);",
+          "out:\n"
+          "   virgl_resource_cache_entry_init(&res->cache_entry, params);",
           "   /* Winlator classic diagnostic: swapchain health. */\n"
           "   {\n"
           "      static int mkres_n = 0;\n"
@@ -971,8 +971,8 @@ jobs:
           "                 (void *)res->dt, res->ptr);\n"
           "      mkres_n++;\n"
           "   }\n"
-          " out:\n"
-          "    virgl_resource_cache_entry_init(&res->cache_entry, params);",
+          "out:\n"
+          "   virgl_resource_cache_entry_init(&res->cache_entry, params);",
           "W11-mkres")
 
           # --- X0/X1: log silent swap skips in the xlib frontend (diagnostic) ---
