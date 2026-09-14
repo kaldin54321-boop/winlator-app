@@ -69,6 +69,19 @@ name: Build VirGL (virpipe) for Winlator Frost v3 (aarch64 glibc)
 # (XServerDisplayActivity VIRGL branch), so new assets resolve under either
 # app generation.
 #
+# Blackscreen errata (virgl-25.0.0 showed as detected yet TestD3D stayed
+# black at 0 FPS): context creation and caps use ids 1-2, so detection works
+# even when presentation is dead. Three present-path killers were found and
+# are all handled: (a) Mesa >= 24 prefers DRI3 present, whose frontbuffers
+# are not virgl display-target resources -- the old W8 hunk dropped those
+# flushes, so id 9 was never sent (W8 now presents via id 9 regardless of
+# dt; the app also exports LIBGL_DRI3_DISABLE=1 to prefer the classic swap
+# path); (b) vtest protocol v3 extras (blob/capset/param/submit2) have no
+# host handler and would desync the stream -- W9/W10 neutralize their senders
+# and the host drains unknown commands instead of misparsing them; (c) the
+# host flush ran without a current EGL context and died on unknown handles
+# silently -- it now makes its context current, guards the lookup, and logs.
+#
 # Design notes:
 #   - Builds run INSIDE a real aarch64 container via QEMU user-mode emulation
 #     (docker/setup-qemu-action), not manual dpkg --add-architecture
@@ -379,6 +392,18 @@ jobs:
                   return
               write(path, src.replace(old, new, 1))
               print(tag + ": replaced OK")
+
+          def replace_optional(path, sig_pat, new_text, tag):
+              # Like replace_func but tolerant: newer/older Mesa majors may
+              # not have the v3 entry point at all. Log and continue instead
+              # of failing the build; the mandatory W5 if(0) gate plus the
+              # host-side unknown-command drain already cover that case.
+              import re as _re
+              src = read(path)
+              if not _re.search(sig_pat, src, _re.S):
+                  print(tag + ": not present, skipped OK")
+                  return
+              replace_func(path, sig_pat, new_text, tag, tag)
 
           def assert_count(path, sub, want, tag):
               n = read(path).count(sub)
@@ -822,27 +847,87 @@ jobs:
           "   }",
           "W7-flush9")
 
-          # --- W8: log flushes with no display target (diagnostic) ---
+          # --- W8: still present when there is no display target ---
+          # Mesa >= 24 on the DRI3 present path swaps frontbuffers that are
+          # NOT virgl display-target resources (res->dt == NULL). The old
+          # diagnostic dropped those flushes, so the frozen host (which
+          # presents from its own GL FBO on classic id 9) never presented:
+          # permanent black window at 0 FPS while caps/context creation still
+          # succeeded. Emit the id-9 flush here too, then return (the guest
+          # has no displaytarget to update locally; the host FBO is the
+          # whole present). The dt != NULL path below (W7) is unchanged.
           replace_once(WINS,
           "   if (!res->dt)\n"
           "      return;",
           "   if (!res->dt) {\n"
-          "      /* Winlator classic diagnostic: without a display target there is\n"
-          "       * nothing to present; count these to rule out a silent no-op. */\n"
+          "      /* Winlator classic: no guest display target, but the host still\n"
+          "       * presents from its own GL FBO on VCMD_FLUSH_FRONTBUFFER (id 9). */\n"
           "      static int nodt_n = 0;\n"
+          "      uint32_t nodt_hdr[VTEST_HDR_SIZE];\n"
+          "      uint32_t nodt_cmd[2];\n"
           "      if (nodt_n < 3)\n"
-          "         fprintf(stderr, \"virgl-classic: flush with NULL dt, skipping present\\n\");\n"
+          "         fprintf(stderr, \"virgl-classic: flush with NULL dt, presenting via id 9 handle=%u\\n\",\n"
+          "                 res->res_handle);\n"
           "      nodt_n++;\n"
+          "      nodt_hdr[VTEST_CMD_LEN] = 2;\n"
+          "      nodt_hdr[VTEST_CMD_ID] = 9; /* Winlator classic VCMD_FLUSH_FRONTBUFFER */\n"
+          "      nodt_cmd[0] = res->res_handle;\n"
+          "      nodt_cmd[1] = (uint32_t)(uintptr_t)winsys_drawable_handle;\n"
+          "      { char *p_ = (char *)nodt_hdr; int l_ = sizeof(nodt_hdr), r_;\n"
+          "        while (l_ > 0) { r_ = write(vtws->sock_fd, p_, l_);\n"
+          "          if (r_ <= 0) break; l_ -= r_; p_ += r_; } }\n"
+          "      { char *p_ = (char *)nodt_cmd; int l_ = sizeof(nodt_cmd), r_;\n"
+          "        while (l_ > 0) { r_ = write(vtws->sock_fd, p_, l_);\n"
+          "          if (r_ <= 0) break; l_ -= r_; p_ += r_; } }\n"
           "      return;\n"
           "   }",
           "W8-flushdt")
 
+          # --- W9: neutralize v3 blob creation (frozen host has no handler) ---
+          # Tolerant: the blob entry point only exists on newer Mesa; older
+          # majors take the W5 if(0) path alone. Warn instead of failing.
+          replace_optional(WINS,
+          r"virgl_vtest_send_create_blob\(.*?\)\s*\{",
+          r"""uint32_t
+          virgl_vtest_send_create_blob(struct virgl_vtest_winsys *vws,
+                                             uint32_t size, uint32_t blob_id, int *fd)
+          {
+             /* Winlator classic: blob resources have no host handler; fail
+              * loudly so the caller falls back instead of hanging the GL
+              * thread forever (black window, FPS 0). */
+             (void)vws; (void)size; (void)blob_id;
+             fprintf(stderr, "virgl-classic: blob create requested, no host support\n");
+             *fd = -1;
+             return 0;
+          }
+          """,
+           "W9-noblob-func")
+
+          # --- W10: neutralize v3 capset/param queries (host serves caps v2) ---
+          # Tolerant for the same reason as W9.
+          replace_optional(WINS,
+          r"virgl_vtest_send_get_capset\(.*?\)\s*\{",
+          r"""int virgl_vtest_send_get_capset(struct virgl_vtest_winsys *vws,
+                                                uint32_t capset, uint32_t version,
+                                                void *caps, uint32_t size)
+          {
+             /* Winlator classic: the frozen host serves the classic GET_CAPS
+              * (id 2) only; claim unsupported so callers use that path. */
+             (void)vws; (void)capset; (void)version; (void)caps; (void)size;
+             return -1;
+          }
+          """,
+           "W10-nocapset")
+
           # --- verification: every hunk left exactly one marker ---
           # NOTE: S-submit2 and W7-flush9 each legitimately contain TWO
           # "Winlator classic" markers (explanatory comment + code comment),
-          # hence 12 SOCK / 10 WINS rather than 11 / 9.
+          # hence 12 SOCK. WINS is a minimum, not exact: W9/W10 are optional
+          # (present only on Mesa majors that have those v3 entry points), so
+          # the base 10 markers (W1a..W8) may grow by up to 2.
           assert_count(SOCK, "Winlator classic", 12, "A-sock-markers")
-          assert_count(WINS, "Winlator classic", 10, "A-wins-markers")
+          assert_min(WINS, "Winlator classic", 10, "A-wins-markers")
+          assert_min(WINS, "presenting via id 9", 1, "A-flush-nodt")
           assert_min(SOCK, "VIRGL_SERVER_PATH", 2, "A-env-fallback")
           assert_count(WINS, "align_malloc(size, 64)", 0, "A-no-malloc")
           assert_count(WINS, "virgl_vtest_send_transfer_put_data", 0, "A-no-put-bulk")
