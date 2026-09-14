@@ -77,7 +77,8 @@ name: Build VirGL (virpipe) for Winlator Frost v3 (aarch64 glibc)
 # flushes, so id 9 was never sent (W8 now presents via id 9 regardless of
 # dt; the app also exports LIBGL_DRI3_DISABLE=1 to prefer the classic swap
 # path); (b) vtest protocol v3 extras (blob/capset/param/submit2) have no
-# host handler and would desync the stream -- W9/W10 neutralize their senders
+# host handler and would desync the stream -- blob creation is blocked at
+# its caller (W5 if(0)), W10 neutralizes the capset sender when present,
 # and the host drains unknown commands instead of misparsing them; (c) the
 # host flush ran without a current EGL context and died on unknown handles
 # silently -- it now makes its context current, guards the lookup, and logs.
@@ -398,12 +399,25 @@ jobs:
               # not have the v3 entry point at all. Log and continue instead
               # of failing the build; the mandatory W5 if(0) gate plus the
               # host-side unknown-command drain already cover that case.
+              # SAFEGUARD (learned 2026-09-14: a W9 pattern whose first match
+              # was a *call site*, not the definition, stretched across
+              # neighboring functions and ate their markers, dropping the
+              # WINS count 10 -> 9): if the replacement would *reduce* the
+              # marker count, restore the original and skip instead.
               import re as _re
               src = read(path)
               if not _re.search(sig_pat, src, _re.S):
                   print(tag + ": not present, skipped OK")
                   return
+              before_markers = src.count("Winlator classic")
+              before_failed = len(failed)
               replace_func(path, sig_pat, new_text, tag, tag)
+              if len(failed) == before_failed:
+                  after_markers = read(path).count("Winlator classic")
+                  if after_markers < before_markers:
+                      write(path, src)
+                      print(tag + ": ate %d marker(s), reverted and skipped OK"
+                            % (before_markers - after_markers))
 
           def assert_count(path, sub, want, tag):
               n = read(path).count(sub)
@@ -883,26 +897,14 @@ jobs:
           "   }",
           "W8-flushdt")
 
-          # --- W9: neutralize v3 blob creation (frozen host has no handler) ---
-          # Tolerant: the blob entry point only exists on newer Mesa; older
-          # majors take the W5 if(0) path alone. Warn instead of failing.
-          replace_optional(WINS,
-          r"virgl_vtest_send_create_blob\(.*?\)\s*\{",
-          r"""uint32_t
-          virgl_vtest_send_create_blob(struct virgl_vtest_winsys *vws,
-                                             uint32_t size, uint32_t blob_id, int *fd)
-          {
-             /* Winlator classic: blob resources have no host handler; fail
-              * loudly so the caller falls back instead of hanging the GL
-              * thread forever (black window, FPS 0). */
-             (void)vws; (void)size; (void)blob_id;
-             fprintf(stderr, "virgl-classic: blob create requested, no host support\n");
-             *fd = -1;
-             return 0;
-          }
-          """,
-           "W9-noblob-func")
-
+          # --- W9: REMOVED (was: neutralize virgl_vtest_send_create_blob) ---
+          # The blob path is already dead via the mandatory W5 if(0) gate at
+          # its caller, so replacing the function itself buys nothing -- and
+          # the name's first occurrence in this file is a *call site*, so a
+          # function-signature regex stretched across neighboring functions
+          # and ate their markers (WINS count dropped 10 -> 9, failing the
+          # gate). Do not re-add a function-level blob hunk here.
+          #
           # --- W10: neutralize v3 capset/param queries (host serves caps v2) ---
           # Tolerant for the same reason as W9.
           replace_optional(WINS,
@@ -922,9 +924,9 @@ jobs:
           # --- verification: every hunk left exactly one marker ---
           # NOTE: S-submit2 and W7-flush9 each legitimately contain TWO
           # "Winlator classic" markers (explanatory comment + code comment),
-          # hence 12 SOCK. WINS is a minimum, not exact: W9/W10 are optional
-          # (present only on Mesa majors that have those v3 entry points), so
-          # the base 10 markers (W1a..W8) may grow by up to 2.
+          # hence 12 SOCK. WINS is a minimum, not exact: W10 is optional
+          # (present only on Mesa majors that have that v3 entry point), so
+          # the base 10 markers (W1a..W8) may grow by up to 1.
           assert_count(SOCK, "Winlator classic", 12, "A-sock-markers")
           assert_min(WINS, "Winlator classic", 10, "A-wins-markers")
           assert_min(WINS, "presenting via id 9", 1, "A-flush-nodt")
