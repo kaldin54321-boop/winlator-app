@@ -71,17 +71,23 @@ name: Build VirGL (virpipe) for Winlator Frost v3 (aarch64 glibc)
 #
 # Blackscreen errata (virgl-25.0.0 showed as detected yet TestD3D stayed
 # black at 0 FPS): context creation and caps use ids 1-2, so detection works
-# even when presentation is dead. Three present-path killers were found and
-# are all handled: (a) Mesa >= 24 prefers DRI3 present, whose frontbuffers
-# are not virgl display-target resources -- the old W8 hunk dropped those
-# flushes, so id 9 was never sent (W8 now presents via id 9 regardless of
-# dt; the app also exports LIBGL_DRI3_DISABLE=1 to prefer the classic swap
-# path); (b) vtest protocol v3 extras (blob/capset/param/submit2) have no
-# host handler and would desync the stream -- blob creation is blocked at
-# its caller (W5 if(0)), W10 neutralizes the capset sender when present,
-# and the host drains unknown commands instead of misparsing them; (c) the
-# host flush ran without a current EGL context and died on unknown handles
-# silently -- it now makes its context current, guards the lookup, and logs.
+# even when presentation is dead. Findings so far: (a) frontbuffers that are
+# not virgl display-target resources were dropped by the old W8 hunk, so id
+# 9 was never sent (W8 now presents via id 9 regardless of dt; there is no
+# DRI3 code in xlib builds at all -- verified 0 DRI3 strings in both assets
+# -- so LIBGL_DRI3_DISABLE is a harmless no-op kept defensively); (b) vtest
+# protocol v3 extras (blob/capset/param/submit2) have no host handler and
+# would desync the stream -- blob creation is blocked at its caller (W5
+# if(0)), W10 neutralizes the capset sender when present, and the host
+# drains unknown commands instead of misparsing them; (c) the host flush ran
+# without a current EGL context and died on unknown handles silently -- it
+# now makes its context current, guards the lookup, and logs; (d) the frozen
+# host's caps_v2 ends at scanout while Mesa 25's struct is longer, so
+# capability_bits_v2 and later fields arrived as stack garbage (randomly
+# enabling staging paths the classic wire cannot serve) -- S-getcaps now
+# zero-fills and defaults max_texture_samplers; (e) the xmesa swap chain and
+# resource creates are instrumented (W11/X1) because the failing builds never
+# invoked the winsys flush at all -- the swap dies upstream of it.
 #
 # Design notes:
 #   - Builds run INSIDE a real aarch64 container via QEMU user-mode emulation
@@ -286,6 +292,7 @@ jobs:
 
           SOCK = "src/gallium/winsys/virgl/vtest/virgl_vtest_socket.c"
           WINS = "src/gallium/winsys/virgl/vtest/virgl_vtest_winsys.c"
+          XMST = "src/gallium/frontends/glx/xlib/xm_st.c"
           failed = []
 
           def read(path):
@@ -440,6 +447,14 @@ jobs:
           '      socket_name = os_get_option("VIRGL_SERVER_PATH");',
           "S-env")
 
+          # --- S-inc: string.h + stddef.h for the memset/offsetof below ---
+          replace_once(SOCK,
+          "#include <unistd.h>",
+          "#include <stddef.h>\n"
+          "#include <string.h>\n"
+          "#include <unistd.h>",
+          "S-inc")
+
           # --- S-init: empty CREATE on classic id 1, no name payload ---
           replace_func(SOCK,
           r"static int virgl_vtest_send_init\(struct virgl_vtest_winsys \*vws\)\s*\{",
@@ -485,6 +500,15 @@ jobs:
              char dummy[256];
              int ret;
 
+             /* The frozen host's caps_v2 ends at scanout while this Mesa's
+              * struct keeps growing (capability_bits_v2, video caps,
+              * max_texture_samplers, ...). Zero the whole struct first so
+              * fields the host never sends are deterministic 0 instead of
+              * stack garbage (garbage capability_bits_v2 would randomly
+              * enable staging/copy-transfer paths the classic wire cannot
+              * serve). */
+             memset(&caps->caps, 0, sizeof(caps->caps));
+
              /* Winlator classic wire format: a single GET_CAPS (id 2). The frozen
               * host answers once with {caps_size + 1, 2} plus the caps bytes, so
               * the upstream GET_CAPS2 + GET_CAPS double request (which would wait
@@ -515,6 +539,13 @@ jobs:
                    break;
                 left -= n;
              }
+             /* max_texture_samplers was added after the frozen host's caps_v2
+              * (it ends at scanout): with only the memset above it would stay
+              * 0 and disable all texture samplers. Default to PIPE's ceiling
+              * when the host did not send that far. */
+             if (resp_size < offsetof(struct virgl_caps_v2, max_texture_samplers) +
+                              sizeof(caps->caps.v2.max_texture_samplers))
+                caps->caps.v2.max_texture_samplers = 32;
              return 0;
           }
           """,
@@ -681,7 +712,10 @@ jobs:
               * command flow from guest to host is alive. */
              {
                 static int submit_n = 0;
-                if (submit_n < 3 || (submit_n % 1000) == 0)
+                /* First-3 only: the periodic trace drowned early boot/present
+                 * diagnostics in logcat (hundreds of thousands of fence-sync
+                 * submits per session). */
+                if (submit_n < 3)
                    fprintf(stderr, "virgl-classic: submit #%d cdw=%u\n", submit_n, buf_len);
                 submit_n++;
              }
@@ -921,14 +955,60 @@ jobs:
           """,
            "W10-nocapset")
 
+          # --- W11: log every resource create (swapchain health diagnostic) ---
+          # Cache misses land here with bind/size/dt state; throttled so
+          # logcat keeps early lines. No creates logged here plus X1 firing
+          # below means the frontend never got as far as swap.
+          replace_once(WINS,
+          " out:\n"
+          "    virgl_resource_cache_entry_init(&res->cache_entry, params);",
+          "   /* Winlator classic diagnostic: swapchain health. */\n"
+          "   {\n"
+          "      static int mkres_n = 0;\n"
+          "      if (mkres_n < 16)\n"
+          "         fprintf(stderr, \"virgl-classic: create ok handle=%u bind=%u %ux%u size=%d dt=%p ptr=%p\\n\",\n"
+          "                 res->res_handle, res->bind, res->width, res->height, res->size,\n"
+          "                 (void *)res->dt, res->ptr);\n"
+          "      mkres_n++;\n"
+          "   }\n"
+          " out:\n"
+          "    virgl_resource_cache_entry_init(&res->cache_entry, params);",
+          "W11-mkres")
+
+          # --- X0/X1: log silent swap skips in the xlib frontend (diagnostic) ---
+          # xmesa swap -> display() returns success without presenting when the
+          # BACK texture was never allocated (resource_create failed upstream).
+          # That state is otherwise indistinguishable from a working swap.
+          replace_once(XMST,
+          "#include \"state_tracker/st_context.h\"",
+          "#include <stdio.h>\n"
+          "#include \"state_tracker/st_context.h\"",
+          "X0-stdio")
+          replace_once(XMST,
+          "   if (!ptex)\n"
+          "      return true;",
+          "   if (!ptex) {\n"
+          "      /* Winlator classic diagnostic: swap with no BACK texture means\n"
+          "       * the swapchain resource_create failed upstream; the swap is a\n"
+          "       * silent no-op (black window, 0 FPS) unless logged here. */\n"
+          "      static int nulltex_n = 0;\n"
+          "      if (nulltex_n < 8)\n"
+          "         fprintf(stderr, \"virgl-classic: swap display with NULL %s texture (silent skip %d)\\n\",\n"
+          "                 statt == ST_ATTACHMENT_BACK_LEFT ? \"BACK\" : \"other\", nulltex_n);\n"
+          "      nulltex_n++;\n"
+          "      return true;\n"
+          "   }",
+          "X1-nulltex")
+
           # --- verification: every hunk left exactly one marker ---
           # NOTE: S-submit2 and W7-flush9 each legitimately contain TWO
           # "Winlator classic" markers (explanatory comment + code comment),
           # hence 12 SOCK. WINS is a minimum, not exact: W10 is optional
           # (present only on Mesa majors that have that v3 entry point), so
-          # the base 10 markers (W1a..W8) may grow by up to 1.
+          # the base 11 markers (W1a..W8 + W11) may grow by up to 1.
           assert_count(SOCK, "Winlator classic", 12, "A-sock-markers")
-          assert_min(WINS, "Winlator classic", 10, "A-wins-markers")
+          assert_min(WINS, "Winlator classic", 11, "A-wins-markers")
+          assert_min(XMST, "Winlator classic", 1, "A-xmst-markers")
           assert_min(WINS, "presenting via id 9", 1, "A-flush-nodt")
           assert_min(SOCK, "VIRGL_SERVER_PATH", 2, "A-env-fallback")
           assert_count(WINS, "align_malloc(size, 64)", 0, "A-no-malloc")
