@@ -20,7 +20,7 @@ name: Build VirGL (virpipe) for Winlator Frost v3 (aarch64 glibc)
 #       assets/graphics_driver/virgl-<DefaultVersion.VIRGL>.tzst
 #     into RootFS rootDir (<files>/rootfs). After dropping the produced
 #     .tzst under app/app/src/main/assets/graphics_driver/, bump
-#     DefaultVersion.VIRGL to the built version (e.g. "25.0.0"). No other
+#     DefaultVersion.VIRGL to the built version (e.g. "25.0.7"). No other
 #     app change is needed:
 #     - the cacheId already contains DefaultVersion.valueOf("virgl"), so the
 #       version bump alone forces a one-time re-extract AND drops the stale
@@ -69,9 +69,13 @@ name: Build VirGL (virpipe) for Winlator Frost v3 (aarch64 glibc)
 # (XServerDisplayActivity VIRGL branch), so new assets resolve under either
 # app generation.
 #
-# Blackscreen errata (virgl-25.0.0 showed as detected yet TestD3D stayed
-# black at 0 FPS): context creation and caps use ids 1-2, so detection works
-# even when presentation is dead. Findings so far: (a) frontbuffers that are
+# Blackscreen errata (the first virgl-25.0.0 asset showed as detected yet
+# TestD3D stayed black at 0 FPS): context creation and caps use ids 1-2, so
+# detection works even when presentation is dead. Its logcat is the smoking
+# gun: submits flow (up to #3600) yet there is not a single virgl-classic
+# guest line and not a single host flush line -- that asset predates the W8
+# null-dt present plus the W11/X1 diagnostics, so the guest winsys dropped
+# every flush upstream of the host. Findings so far: (a) frontbuffers that are
 # not virgl display-target resources were dropped by the old W8 hunk, so id
 # 9 was never sent (W8 now presents via id 9 regardless of dt; there is no
 # DRI3 code in xlib builds at all -- verified 0 DRI3 strings in both assets
@@ -87,7 +91,20 @@ name: Build VirGL (virpipe) for Winlator Frost v3 (aarch64 glibc)
 # enabling staging paths the classic wire cannot serve) -- S-getcaps now
 # zero-fills and defaults max_texture_samplers; (e) the xmesa swap chain and
 # resource creates are instrumented (W11/X1) because the failing builds never
-# invoked the winsys flush at all -- the swap dies upstream of it.
+# invoked the winsys flush at all -- the swap dies upstream of it; (f) the
+# failing guest sent only tiny cdw=16 submits (vs cdw=1040 healthy) with zero
+# draws and zero id-9 flushes, so the host now logs each submit's ccode
+# breakdown plus any decode failure, and the vrend decoder skips unknown
+# ccodes (NOP/render-condition/texture-barrier/QBO-decorated) instead of
+# aborting the submit tail (which silently dropped draws); (g) one layer
+# above the winsys, virgl_screen.c:virgl_flush_frontbuffer unconditionally
+# runs virgl_flush_eq(vctx,...) and vctx->cbuf -- XMesaSwapBuffers arrives
+# with ctx == NULL (xmesa_swap_st_framebuffer passes no st pipe), so the
+# first swap is a NULL deref and no present ever reaches W7/W8 -- W12 guards
+# both derefs (the winsys flush takes no cmdbuf, so NULL is safe). Log
+# signature to
+# compare: healthy shows growing flush #n at 60 FPS; broken shows submits
+# with no DRAW_VBO entries and no flush lines at all.
 #
 # Design notes:
 #   - Builds run INSIDE a real aarch64 container via QEMU user-mode emulation
@@ -95,11 +112,18 @@ name: Build VirGL (virpipe) for Winlator Frost v3 (aarch64 glibc)
 #     cross-compiling. See build-llvmpipe-winlator.yml for the full rationale
 #     (ldconfig SIGSEGV defense, --no-triggers hardening, jammy/glibc-2.35
 #     baseline). All of it applies verbatim here and is repeated below.
-#   - VERSION PIN: default Mesa 25.0.0 -- the same Mesa family as the proven
+#   - VERSION PIN: default Mesa 25.0.7 -- the same Mesa 25 family as the proven
 #     working llvmpipe-25.0.0 asset, so guest shader behavior and the X
-#     server protocol it was verified against stay in one known-good family.
+#     server protocol it was verified against stay in one known-good family,
+#     plus 7 patch releases of virpipe/winsys/frontend fixes over 25.0.0
+#     (the first 25.0.0 asset blackscreened: it predates the W8 null-dt
+#     present and the W12 NULL-ctx guard, so no flush ever reached the host).
 #     Mesa 24.0.x is also accepted via the mesa_version input (same recipe,
-#     no removed-option hazards in the 24-25 range). Do NOT point this at
+#     no removed-option hazards in the 24-25 range). There is deliberately
+#     NO downgrade to 24.x/23.3: the blackscreen is a presentation/wire gap
+#     the compat layer bridges, not a core rasterizer regression, and an
+#     older Mesa would discard the virpipe glitch fixes that motivate this
+#     upgrade from 23.1.9 in the first place. Do NOT point this at
 #     Mesa 26.x without on-device proof: the in-house 26.0.0 llvmpipe build
 #     enumerated correctly yet rendered clear-color/black only (shared
 #     rasterizer output nothing, plausibly misbuilt under QEMU user-mode CI).
@@ -161,12 +185,12 @@ on:
   workflow_dispatch:
     inputs:
       mesa_version:
-        description: "Mesa version to build (must exist as mesa-<ver>.tar.xz on archive.mesa3d.org; 25.0.0 recommended, 24.0.x also supported)"
+        description: "Mesa version to build (must exist as mesa-<ver>.tar.xz on archive.mesa3d.org; 25.0.7 recommended, 24.0.x also supported)"
         required: true
-        default: "25.0.0"
+        default: "25.0.7"
 
 env:
-  MESA_VERSION: ${{ github.event.inputs.mesa_version || '25.0.0' }}
+  MESA_VERSION: ${{ github.event.inputs.mesa_version || '25.0.7' }}
   TARGET_TRIPLE: aarch64-linux-gnu
 
 jobs:
@@ -293,6 +317,7 @@ jobs:
           SOCK = "src/gallium/winsys/virgl/vtest/virgl_vtest_socket.c"
           WINS = "src/gallium/winsys/virgl/vtest/virgl_vtest_winsys.c"
           XMST = "src/gallium/frontends/glx/xlib/xm_st.c"
+          VSCR = "src/gallium/drivers/virgl/virgl_screen.c"
           failed = []
 
           def read(path):
@@ -973,9 +998,37 @@ jobs:
           "   }\n"
           "out:\n"
           "   virgl_resource_cache_entry_init(&res->cache_entry, params);",
-          "W11-mkres")
+           "W11-mkres")
 
-          # --- X0/X1: log silent swap skips in the xlib frontend (diagnostic) ---
+           # --- W12: survive NULL-ctx flushes from the xlib swap path (present) ---
+           # XMesaSwapBuffers calls screen->flush_frontbuffer with ctx == NULL
+           # (xmesa_swap_st_framebuffer passes no st pipe; pending draws were
+           # already submitted by st_context_flush just above it in xm_api.c).
+           # Stock virgl_screen.c then runs virgl_flush_eq(vctx,...) AND
+           # vctx->cbuf, both dereferencing NULL -> SIGSEGV on the first swap,
+           # and even without the crash the winsys flush below would never run,
+           # so no id-9 present ever reaches the frozen host (black window at
+           # 0 FPS while submits keep flowing -- the exact TestD3D signature
+           # of the first 25.0.0 asset, whose logcat shows submits but zero
+           # flushes). Guard both derefs; the winsys flush takes no cmdbuf
+           # (UNUSED) so NULL is safe and the present still reaches the host
+           # via W7/W8. Anchor is the whole if-block (stable since Mesa 23).
+          replace_once(VSCR,
+           "   if (vws->flush_frontbuffer) {\n"
+           "      virgl_flush_eq(vctx, vctx, NULL);\n"
+           "      vws->flush_frontbuffer(vws, vctx->cbuf, vres->hw_res, level, layer, winsys_drawable_handle,\n"
+           "                             nboxes == 1 ? sub_box : NULL);\n"
+           "   }",
+           "   /* Winlator classic: XMesaSwapBuffers arrives with ctx == NULL. */\n"
+           "   if (vws->flush_frontbuffer) {\n"
+           "      if (vctx)\n"
+           "         virgl_flush_eq(vctx, vctx, NULL);\n"
+           "      vws->flush_frontbuffer(vws, vctx ? vctx->cbuf : NULL, vres->hw_res, level, layer, winsys_drawable_handle,\n"
+           "                             nboxes == 1 ? sub_box : NULL);\n"
+           "   }",
+           "W12-nullctx")
+
+           # --- X0/X1: log silent swap skips in the xlib frontend (diagnostic) ---
           # xmesa swap -> display() returns success without presenting when the
           # BACK texture was never allocated (resource_create failed upstream).
           # That state is otherwise indistinguishable from a working swap.
@@ -1000,15 +1053,17 @@ jobs:
           "   }",
           "X1-nulltex")
 
-          # --- verification: every hunk left exactly one marker ---
-          # NOTE: S-submit2 and W7-flush9 each legitimately contain TWO
-          # "Winlator classic" markers (explanatory comment + code comment),
-          # hence 12 SOCK. WINS is a minimum, not exact: W10 is optional
-          # (present only on Mesa majors that have that v3 entry point), so
-          # the base 11 markers (W1a..W8 + W11) may grow by up to 1.
+           # --- verification: every hunk left exactly one marker ---
+           # NOTE: S-submit2 and W7-flush9 each legitimately contain TWO
+           # "Winlator classic" markers (explanatory comment + code comment),
+           # hence 12 SOCK. WINS is a minimum, not exact: W10 is optional
+           # (present only on Mesa majors that have that v3 entry point), so
+           # the base 11 markers (W1a..W8 + W11) may grow by up to 1. VSCR
+           # carries the single W12 NULL-ctx guard marker.
           assert_count(SOCK, "Winlator classic", 12, "A-sock-markers")
           assert_min(WINS, "Winlator classic", 11, "A-wins-markers")
           assert_min(XMST, "Winlator classic", 1, "A-xmst-markers")
+          assert_min(VSCR, "Winlator classic", 1, "A-vscr-markers")
           assert_min(WINS, "presenting via id 9", 1, "A-flush-nodt")
           assert_min(SOCK, "VIRGL_SERVER_PATH", 2, "A-env-fallback")
           assert_count(WINS, "align_malloc(size, 64)", 0, "A-no-malloc")
