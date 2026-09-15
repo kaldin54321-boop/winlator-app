@@ -101,10 +101,23 @@ name: Build VirGL (virpipe) for Winlator Frost v3 (aarch64 glibc)
 # runs virgl_flush_eq(vctx,...) and vctx->cbuf -- XMesaSwapBuffers arrives
 # with ctx == NULL (xmesa_swap_st_framebuffer passes no st pipe), so the
 # first swap is a NULL deref and no present ever reaches W7/W8 -- W12 guards
-# both derefs (the winsys flush takes no cmdbuf, so NULL is safe). Log
-# signature to
-# compare: healthy shows growing flush #n at 60 FPS; broken shows submits
-# with no DRAW_VBO entries and no flush lines at all.
+# both derefs (the winsys flush takes no cmdbuf, so NULL is safe); (h) the
+# 25.0.7 asset DID emit id-9 flushes yet stayed black with FPS counting:
+# host dropped every flush as "unknown drawable=-1610590968" (unsigned
+# 2684376328 = 0xA0005508) while SHM PutImages for the real X window
+# (33554508 = 0x0200004C, head=000... black) kept the FPS counter alive.
+# Root cause: W7/W8 sent (uint32_t)(uintptr_t)winsys_drawable_handle, but
+# that handle is NOT an XID -- it is a struct xlib_drawable* (see
+# src/gallium/include/frontend/xlibsw_api.h: {Visual*, int depth, Drawable
+# drawable} and xm_st.c: flush_frontbuffer(..., &xstfb->buffer->ws, ...)).
+# Truncating the POINTER yields pointer low bits (0xA0...), never the XID
+# at ws->drawable (offset 16 on LP64). W0 includes xlibsw_api.h and W7/W8
+# now dereference ws->drawable (with a NULL guard); the host additionally
+# carries the resource size for a size-based fallback so one bad drawable
+# can never blackscreen again. Log signature to
+# compare: healthy shows growing flush #n at 60 FPS with drawable=0x0200004C-
+# style small XIDs; broken shows flushes for 0xA0... pointer values plus
+# black SHM PutImages (head=000...) on the real window.
 #
 # Design notes:
 #   - Builds run INSIDE a real aarch64 container via QEMU user-mode emulation
@@ -761,6 +774,16 @@ jobs:
           "   cmd[VCMD_BUSY_WAIT_HANDLE] = handle;",
           "S-busy")
 
+          # --- W0: include the xlib drawable struct for real XID extraction ---
+          # winsys_drawable_handle is a struct xlib_drawable* (NOT an XID);
+          # W7/W8 must dereference ws->drawable (see header errata (h)).
+          replace_once(WINS,
+          '#include "virgl_vtest_winsys.h"',
+          '#include "virgl_vtest_winsys.h"\n'
+          '#include "frontend/xlibsw_api.h"\n'
+          '/* Winlator classic: struct xlib_drawable for real-XID flushes. */',
+          "W0-include")
+
           # --- W1a: drop the local-malloc backing branch ---
           replace_once(WINS,
           "   } else if (vtws->protocol_version < 2) {\n"
@@ -874,6 +897,10 @@ jobs:
           "W6-nocoherent")
 
           # --- W7: also send classic FLUSH_FRONTBUFFER (id 9) on present ---
+          # winsys_drawable_handle is struct xlib_drawable* (xm_st.c passes
+          # &xstfb->buffer->ws); the XID lives at ws->drawable. Sending the
+          # truncated POINTER (old code) yields 0xA0... values the host drops
+          # as unknown drawable -> black window with FPS from SHM fallback.
           replace_once(WINS,
           "   vtws->sws->displaytarget_display(vtws->sws, res->dt, winsys_drawable_handle,\n"
           "                                    !!sub_box, sub_box);",
@@ -890,12 +917,15 @@ jobs:
           "      char *flush_ptr;\n"
           "      int flush_left;\n"
           "      int flush_ret;\n"
+          "      uint32_t real_drawable = 0;\n"
+          "      if (winsys_drawable_handle)\n"
+          "         real_drawable = (uint32_t)((struct xlib_drawable *)winsys_drawable_handle)->drawable;\n"
           "      flush_hdr[VTEST_CMD_LEN] = 2;\n"
           "      flush_hdr[VTEST_CMD_ID] = 9; /* Winlator classic VCMD_FLUSH_FRONTBUFFER */\n"
           "      flush_cmd[0] = res->res_handle;\n"
-          "      flush_cmd[1] = (uint32_t)(uintptr_t)winsys_drawable_handle;\n"
+          "      flush_cmd[1] = real_drawable;\n"
           "      if (flush_n < 3) {\n"
-          "         fprintf(stderr, \"virgl-classic: flush handle=%u drawable=%u (%p) %ux%u\\n\",\n"
+          "         fprintf(stderr, \"virgl-classic: flush handle=%u drawable=%u (%p real) %ux%u\\n\",\n"
           "                 flush_cmd[0], flush_cmd[1], winsys_drawable_handle, res->width, res->height);\n"
           "      }\n"
           "      flush_n++;\n"
@@ -929,6 +959,8 @@ jobs:
           # succeeded. Emit the id-9 flush here too, then return (the guest
           # has no displaytarget to update locally; the host FBO is the
           # whole present). The dt != NULL path below (W7) is unchanged.
+          # Same XID rule as W7: dereference struct xlib_drawable, never the
+          # pointer itself (see header errata (h)).
           replace_once(WINS,
           "   if (!res->dt)\n"
           "      return;",
@@ -938,14 +970,17 @@ jobs:
           "      static int nodt_n = 0;\n"
           "      uint32_t nodt_hdr[VTEST_HDR_SIZE];\n"
           "      uint32_t nodt_cmd[2];\n"
+          "      uint32_t nodt_drawable = 0;\n"
+          "      if (winsys_drawable_handle)\n"
+          "         nodt_drawable = (uint32_t)((struct xlib_drawable *)winsys_drawable_handle)->drawable;\n"
           "      if (nodt_n < 3)\n"
-          "         fprintf(stderr, \"virgl-classic: flush with NULL dt, presenting via id 9 handle=%u\\n\",\n"
-          "                 res->res_handle);\n"
+          "         fprintf(stderr, \"virgl-classic: flush with NULL dt, presenting via id 9 handle=%u drawable=%u\\n\",\n"
+          "                 res->res_handle, nodt_drawable);\n"
           "      nodt_n++;\n"
           "      nodt_hdr[VTEST_CMD_LEN] = 2;\n"
           "      nodt_hdr[VTEST_CMD_ID] = 9; /* Winlator classic VCMD_FLUSH_FRONTBUFFER */\n"
           "      nodt_cmd[0] = res->res_handle;\n"
-          "      nodt_cmd[1] = (uint32_t)(uintptr_t)winsys_drawable_handle;\n"
+          "      nodt_cmd[1] = nodt_drawable;\n"
           "      { char *p_ = (char *)nodt_hdr; int l_ = sizeof(nodt_hdr), r_;\n"
           "        while (l_ > 0) { r_ = write(vtws->sock_fd, p_, l_);\n"
           "          if (r_ <= 0) break; l_ -= r_; p_ += r_; } }\n"
@@ -1058,13 +1093,16 @@ jobs:
            # "Winlator classic" markers (explanatory comment + code comment),
            # hence 12 SOCK. WINS is a minimum, not exact: W10 is optional
            # (present only on Mesa majors that have that v3 entry point), so
-           # the base 11 markers (W1a..W8 + W11) may grow by up to 1. VSCR
+           # the base 12 markers (W0..W8 + W11) may grow by up to 1. VSCR
            # carries the single W12 NULL-ctx guard marker.
           assert_count(SOCK, "Winlator classic", 12, "A-sock-markers")
-          assert_min(WINS, "Winlator classic", 11, "A-wins-markers")
+          assert_min(WINS, "Winlator classic", 12, "A-wins-markers")
           assert_min(XMST, "Winlator classic", 1, "A-xmst-markers")
           assert_min(VSCR, "Winlator classic", 1, "A-vscr-markers")
           assert_min(WINS, "presenting via id 9", 1, "A-flush-nodt")
+          assert_min(WINS, "xlibsw_api.h", 1, "A-xlib-include")
+          assert_min(WINS, "struct xlib_drawable", 2, "A-xid-deref")
+          assert_count(WINS, "(uint32_t)(uintptr_t)winsys_drawable_handle", 0, "A-no-ptr-flush")
           assert_min(SOCK, "VIRGL_SERVER_PATH", 2, "A-env-fallback")
           assert_count(WINS, "align_malloc(size, 64)", 0, "A-no-malloc")
           assert_count(WINS, "virgl_vtest_send_transfer_put_data", 0, "A-no-put-bulk")
